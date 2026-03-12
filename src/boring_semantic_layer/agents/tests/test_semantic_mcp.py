@@ -637,22 +637,22 @@ class TestDescriptionSupport:
         flights_data = pd.DataFrame(
             {"carrier": ["AA", "UA"], "distance": [100, 200]},
         )
-        flights_tbl = con.create_table("flights", flights_data, overwrite=True)
+        flights_tbl = con.create_table("flights_desc", flights_data, overwrite=True)
 
         flights = (
             to_semantic_table(
                 flights_tbl,
-                name="flights",
+                name="flights_desc",
                 description="Flight departure data",
             )
             .with_dimensions(carrier=lambda t: t.carrier)
             .with_measures(total_distance=lambda t: t.distance.sum())
         )
 
-        mcp = MCPSemanticModel(models={"flights": flights})
+        mcp = MCPSemanticModel(models={"flights_desc": flights})
 
         async with Client(mcp) as client:
-            result = await client.call_tool("get_model", {"model_name": "flights"})
+            result = await client.call_tool("get_model", {"model_name": "flights_desc"})
             model_info = json.loads(result.content[0].text)
 
             assert "description" in model_info
@@ -664,18 +664,18 @@ class TestDescriptionSupport:
         flights_data = pd.DataFrame(
             {"carrier": ["AA", "UA"], "distance": [100, 200]},
         )
-        flights_tbl = con.create_table("flights", flights_data, overwrite=True)
+        flights_tbl = con.create_table("flights_nodesc", flights_data, overwrite=True)
 
         flights = (
-            to_semantic_table(flights_tbl, name="flights")
+            to_semantic_table(flights_tbl, name="flights_nodesc")
             .with_dimensions(carrier=lambda t: t.carrier)
             .with_measures(total_distance=lambda t: t.distance.sum())
         )
 
-        mcp = MCPSemanticModel(models={"flights": flights})
+        mcp = MCPSemanticModel(models={"flights_nodesc": flights})
 
         async with Client(mcp) as client:
-            result = await client.call_tool("get_model", {"model_name": "flights"})
+            result = await client.call_tool("get_model", {"model_name": "flights_nodesc"})
             model_info = json.loads(result.content[0].text)
 
             assert "description" not in model_info
@@ -689,8 +689,8 @@ class TestDescriptionSupport:
         carriers_data = pd.DataFrame(
             {"code": ["AA", "UA"], "name": ["American", "United"]},
         )
-        flights_tbl = con.create_table("flights", flights_data, overwrite=True)
-        carriers_tbl = con.create_table("carriers", carriers_data, overwrite=True)
+        flights_tbl = con.create_table("flights_join_desc", flights_data, overwrite=True)
+        carriers_tbl = con.create_table("carriers_join_desc", carriers_data, overwrite=True)
 
         flights = (
             to_semantic_table(
@@ -855,3 +855,171 @@ class TestSearchDimensionValues:
                 assert "count" in item
                 assert isinstance(item["count"], int)
                 assert item["count"] > 0
+
+
+class TestToolTagsAndAnnotations:
+    """Test that tools have proper tags and annotations (FastMCP 3.0)."""
+
+    @pytest.mark.asyncio
+    async def test_all_tools_have_annotations(self, sample_models):
+        """Test that all tools have readOnlyHint=True annotation."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+            for tool in tools:
+                assert tool.annotations is not None, f"{tool.name} missing annotations"
+                assert tool.annotations.readOnlyHint is True, (
+                    f"{tool.name} should have readOnlyHint=True"
+                )
+
+    @pytest.mark.asyncio
+    async def test_tool_tag_taxonomy(self, sample_models):
+        """Test that tools have the expected tag assignments."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        expected_tags = {
+            "list_models": {"discovery"},
+            "get_model": {"discovery", "metadata"},
+            "get_time_range": {"metadata"},
+            "query_model": {"query"},
+            "search_dimension_values": {"discovery", "query"},
+        }
+
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+            tool_map = {t.name: t for t in tools}
+
+            for tool_name in expected_tags:
+                assert tool_name in tool_map, f"Tool {tool_name} not found"
+                assert tool_map[tool_name].annotations is not None
+
+    @pytest.mark.asyncio
+    async def test_five_tools_registered(self, sample_models):
+        """Test that exactly 5 tools are registered."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+            tool_names = {t.name for t in tools}
+            expected = {
+                "list_models",
+                "get_model",
+                "get_time_range",
+                "query_model",
+                "search_dimension_values",
+            }
+            assert tool_names == expected
+
+
+class TestMCPResources:
+    """Test MCP Resources (FastMCP 3.0)."""
+
+    @pytest.mark.asyncio
+    async def test_list_models_resource(self, sample_models):
+        """Test the semantic://models resource returns all models."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            result = await client.read_resource("semantic://models")
+            data = json.loads(result[0].text)
+
+            assert "flights" in data
+            assert "carriers" in data
+
+    @pytest.mark.asyncio
+    async def test_model_schema_resource(self, sample_models):
+        """Test the semantic://models/{name} resource returns model schema."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            result = await client.read_resource("semantic://models/flights")
+            model_info = json.loads(result[0].text)
+
+            assert model_info["name"] == "flights"
+            assert "origin" in model_info["dimensions"]
+            assert "flight_count" in model_info["measures"]
+
+    @pytest.mark.asyncio
+    async def test_time_range_resource(self, sample_models):
+        """Test the semantic://models/{name}/time-range resource."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            result = await client.read_resource("semantic://models/flights/time-range")
+            data = json.loads(result[0].text)
+
+            assert data["model"] == "flights"
+            assert "start" in data
+            assert "end" in data
+            assert data["start"].startswith("2024-01-01")
+
+    @pytest.mark.asyncio
+    async def test_time_range_resource_no_time_dim(self, sample_models):
+        """Test time-range resource for model without time dimension returns error."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            result = await client.read_resource("semantic://models/carriers/time-range")
+            data = json.loads(result[0].text)
+
+            assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_resources_are_listed(self, sample_models):
+        """Test that resources appear in list_resources."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            resources = await client.list_resources()
+            resource_uris = {str(r.uri) for r in resources}
+
+            assert "semantic://models" in resource_uris
+
+
+class TestMCPPrompts:
+    """Test MCP Prompts (FastMCP 3.0)."""
+
+    @pytest.mark.asyncio
+    async def test_prompts_are_listed(self, sample_models):
+        """Test that prompts appear in list_prompts."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            prompts = await client.list_prompts()
+            prompt_names = {p.name for p in prompts}
+
+            assert "query_guide" in prompt_names
+            assert "model_exploration_guide" in prompt_names
+            assert "getting_started" in prompt_names
+
+    @pytest.mark.asyncio
+    async def test_query_guide_prompt_has_content(self, sample_models):
+        """Test that query_guide prompt returns non-empty content."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            result = await client.get_prompt("query_guide")
+            assert len(result.messages) > 0
+            assert len(result.messages[0].content.text) > 0
+
+    @pytest.mark.asyncio
+    async def test_getting_started_prompt_has_content(self, sample_models):
+        """Test that getting_started prompt returns the system instructions."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            result = await client.get_prompt("getting_started")
+            assert len(result.messages) > 0
+            text = result.messages[0].content.text
+            assert len(text) > 0
+
+    @pytest.mark.asyncio
+    async def test_model_exploration_guide_prompt(self, sample_models):
+        """Test that model_exploration_guide prompt returns content."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            result = await client.get_prompt("model_exploration_guide")
+            assert len(result.messages) > 0
+            assert len(result.messages[0].content.text) > 0

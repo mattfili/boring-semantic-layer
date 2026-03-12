@@ -39,7 +39,7 @@ agent = [
 
 # MCP server backend
 mcp = [
-    "fastmcp>=2.12.4",
+    "fastmcp>=3.0.0",
 ]
 
 dev = [

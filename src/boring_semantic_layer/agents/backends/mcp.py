@@ -7,7 +7,9 @@ from typing import Annotated, Any
 
 import ibis
 from dotenv import load_dotenv
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
+from fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 from pydantic import Field
 from pydantic.functional_validators import BeforeValidator
 
@@ -44,6 +46,33 @@ def _parse_json_string(v: Any) -> Any:
     return v
 
 
+def _build_model_info(model: Any) -> dict[str, Any]:
+    """Build model metadata dict from a semantic model (shared by tool and resource)."""
+    dimensions = {}
+    for name, dim in model.get_dimensions().items():
+        dimensions[name] = {
+            "description": dim.description,
+            "is_time_dimension": dim.is_time_dimension,
+            "smallest_time_grain": dim.smallest_time_grain,
+        }
+
+    measures = {}
+    for name, meas in model.get_measures().items():
+        measures[name] = {"description": meas.description}
+
+    result = {
+        "name": model.name or "unnamed",
+        "dimensions": dimensions,
+        "measures": measures,
+        "calculated_measures": list(model.get_calculated_measures().keys()),
+    }
+
+    if model.description:
+        result["description"] = model.description
+
+    return result
+
+
 class MCPSemanticModel(FastMCP):
     def __init__(
         self,
@@ -55,11 +84,15 @@ class MCPSemanticModel(FastMCP):
         super().__init__(name=name, instructions=instructions, **kwargs)
         self.models = models
         self._register_tools()
+        self._register_resources()
+        self._register_prompts()
 
     def _register_tools(self):
         @self.tool(
             name="list_models",
             description=load_prompt(PROMPTS_DIR, "tool-list-models-desc.md"),
+            tags={"discovery"},
+            annotations=ToolAnnotations(readOnlyHint=True),
         )
         def list_models() -> Mapping[str, str]:
             return {name: f"Semantic model: {name}" for name in self.models}
@@ -67,53 +100,31 @@ class MCPSemanticModel(FastMCP):
         @self.tool(
             name="get_model",
             description=load_prompt(PROMPTS_DIR, "tool-get-model-desc.md"),
+            tags={"discovery", "metadata"},
+            annotations=ToolAnnotations(readOnlyHint=True),
         )
         def get_model(model_name: str) -> Mapping[str, Any]:
             if model_name not in self.models:
-                raise ValueError(f"Model {model_name} not found")
+                raise ToolError(f"Model {model_name} not found")
 
-            model = self.models[model_name]
-
-            # Build dimension info with metadata
-            dimensions = {}
-            for name, dim in model.get_dimensions().items():
-                dimensions[name] = {
-                    "description": dim.description,
-                    "is_time_dimension": dim.is_time_dimension,
-                    "smallest_time_grain": dim.smallest_time_grain,
-                }
-
-            # Build measure info with metadata
-            measures = {}
-            for name, meas in model.get_measures().items():
-                measures[name] = {"description": meas.description}
-
-            result = {
-                "name": model.name or "unnamed",
-                "dimensions": dimensions,
-                "measures": measures,
-                "calculated_measures": list(model.get_calculated_measures().keys()),
-            }
-
-            if model.description:
-                result["description"] = model.description
-
-            return result
+            return _build_model_info(self.models[model_name])
 
         @self.tool(
             name="get_time_range",
             description=load_prompt(PROMPTS_DIR, "tool-get-time-range-desc.md"),
+            tags={"metadata"},
+            annotations=ToolAnnotations(readOnlyHint=True),
         )
         def get_time_range(model_name: str) -> Mapping[str, Any]:
             if model_name not in self.models:
-                raise ValueError(f"Model {model_name} not found")
+                raise ToolError(f"Model {model_name} not found")
 
             model = self.models[model_name]
             all_dims = list(model.dimensions)
             time_dim_name = _find_time_dimension(model, all_dims)
 
             if not time_dim_name:
-                raise ValueError(f"Model {model_name} has no time dimension")
+                raise ToolError(f"Model {model_name} has no time dimension")
 
             # Access column directly from table to avoid Deferred recursion issue
             # time_dim.expr(tbl) returns a Deferred object that causes infinite
@@ -133,8 +144,10 @@ class MCPSemanticModel(FastMCP):
         @self.tool(
             name="query_model",
             description=load_prompt(PROMPTS_DIR, "tool-query-desc.md"),
+            tags={"query"},
+            annotations=ToolAnnotations(readOnlyHint=True),
         )
-        def query_model(
+        async def query_model(
             model_name: str,
             dimensions: Annotated[
                 list[str] | None,
@@ -234,9 +247,17 @@ class MCPSemanticModel(FastMCP):
                     description=load_prompt(PROMPTS_DIR, "tool-query-param-chart_spec.md"),
                 ),
             ] = None,
+            ctx: Context | None = None,
         ) -> str:
             if model_name not in self.models:
-                raise ValueError(f"Model {model_name} not found")
+                raise ToolError(f"Model {model_name} not found")
+
+            if ctx:
+                await ctx.info(
+                    f"Querying model '{model_name}': "
+                    f"dims={dimensions}, measures={measures}"
+                )
+                await ctx.report_progress(progress=10, total=100)
 
             model = self.models[model_name]
             query_result = model.query(
@@ -249,7 +270,10 @@ class MCPSemanticModel(FastMCP):
                 time_range=time_range,
             )
 
-            return generate_chart_with_data(
+            if ctx:
+                await ctx.report_progress(progress=50, total=100)
+
+            result = generate_chart_with_data(
                 query_result,
                 get_records=get_records,
                 records_limit=records_limit,
@@ -260,24 +284,38 @@ class MCPSemanticModel(FastMCP):
                 default_backend="altair",
             )
 
+            if ctx:
+                await ctx.report_progress(progress=100, total=100)
+
+            return result
+
         @self.tool(
             name="search_dimension_values",
             description=load_prompt(PROMPTS_DIR, "tool-search-dimension-values-desc.md"),
+            tags={"discovery", "query"},
+            annotations=ToolAnnotations(readOnlyHint=True),
         )
-        def search_dimension_values(
+        async def search_dimension_values(
             model_name: str,
             dimension_name: str,
             search_term: str | None = None,
             limit: int = 20,
+            ctx: Context | None = None,
         ) -> dict:
             if model_name not in self.models:
-                raise ValueError(f"Model '{model_name}' not found")
+                raise ToolError(f"Model '{model_name}' not found")
+
+            if ctx:
+                await ctx.info(
+                    f"Searching '{dimension_name}' in '{model_name}' "
+                    f"for '{search_term}'"
+                )
 
             model = self.models[model_name]
             dims = model.get_dimensions()
 
             if dimension_name not in dims:
-                raise ValueError(
+                raise ToolError(
                     f"Dimension '{dimension_name}' not found in model '{model_name}'. "
                     f"Available dimensions: {list(dims.keys())}"
                 )
@@ -350,6 +388,91 @@ class MCPSemanticModel(FastMCP):
                 "is_complete": is_complete,
                 "values": values,
             }
+
+    def _register_resources(self):
+        @self.resource(
+            uri="semantic://models",
+            name="Available Models",
+            description="List all available semantic models",
+            mime_type="application/json",
+        )
+        def list_models_resource() -> str:
+            models_list = {}
+            for model_name in self.models:
+                model = self.models[model_name]
+                info = {"name": model_name}
+                if model.description:
+                    info["description"] = model.description
+                models_list[model_name] = info
+            return json.dumps(models_list, indent=2)
+
+        @self.resource(
+            uri="semantic://models/{model_name}",
+            name="Model Schema",
+            description="Get schema with dimensions and measures for a specific model",
+            mime_type="application/json",
+        )
+        def get_model_resource(model_name: str) -> str:
+            if model_name not in self.models:
+                raise ToolError(f"Model {model_name} not found")
+
+            return json.dumps(_build_model_info(self.models[model_name]), indent=2)
+
+        @self.resource(
+            uri="semantic://models/{model_name}/time-range",
+            name="Model Time Range",
+            description="Get date bounds for time-series models",
+            mime_type="application/json",
+        )
+        def get_time_range_resource(model_name: str) -> str:
+            if model_name not in self.models:
+                raise ToolError(f"Model {model_name} not found")
+
+            model = self.models[model_name]
+            all_dims = list(model.dimensions)
+            time_dim_name = _find_time_dimension(model, all_dims)
+
+            if not time_dim_name:
+                return json.dumps({"error": f"Model {model_name} has no time dimension"})
+
+            tbl = model.table
+            col_name = time_dim_name.split(".")[-1] if "." in time_dim_name else time_dim_name
+            time_col = tbl[col_name]
+            result = tbl.aggregate(start=time_col.min(), end=time_col.max()).execute()
+
+            return json.dumps({
+                "model": model_name,
+                "start": result["start"].iloc[0].isoformat(),
+                "end": result["end"].iloc[0].isoformat(),
+            })
+
+    def _register_prompts(self):
+        @self.prompt(
+            name="query_guide",
+            description="Comprehensive query syntax reference for the semantic layer",
+        )
+        def query_guide() -> str:
+            return load_prompt(PROMPTS_DIR, "tool-query.md") or "Query guide not available."
+
+        @self.prompt(
+            name="model_exploration_guide",
+            description="How to explore model metadata (dimensions, measures, time ranges)",
+        )
+        def model_exploration_guide() -> str:
+            return (
+                load_prompt(PROMPTS_DIR, "tool-get-model.md")
+                or "Model exploration guide not available."
+            )
+
+        @self.prompt(
+            name="getting_started",
+            description="Semantic layer overview and usage guidelines",
+        )
+        def getting_started() -> str:
+            return (
+                load_prompt(PROMPTS_DIR, "system.md")
+                or "Getting started guide not available."
+            )
 
 
 def create_mcp_server(

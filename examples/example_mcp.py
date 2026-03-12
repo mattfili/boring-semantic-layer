@@ -2,8 +2,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "boring-semantic-layer[examples] >= 0.2.0",
-#     "boring-semantic-layer[fastmcp] >= 0.2.0"
+#     "boring-semantic-layer[examples] >= 0.3.9",
+#     "boring-semantic-layer[mcp] >= 0.3.9"
 # ]
 # ///
 
