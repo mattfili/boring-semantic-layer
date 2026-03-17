@@ -2,6 +2,7 @@ import json
 import re
 import sys
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -9,7 +10,7 @@ import ibis
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import Annotations, ToolAnnotations
 from pydantic import Field
 from pydantic.functional_validators import BeforeValidator
 
@@ -35,6 +36,14 @@ def _get_prompts_dir() -> Path:
 PROMPTS_DIR = _get_prompts_dir()
 
 SYSTEM_INSTRUCTIONS = load_prompt(PROMPTS_DIR, "system.md") or "MCP server for semantic models"
+
+# Shared annotations — all tools are read-only, idempotent, and operate on a closed model set
+_READONLY_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 
 def _parse_json_string(v: Any) -> Any:
@@ -73,15 +82,80 @@ def _build_model_info(model: Any) -> dict[str, Any]:
     return result
 
 
+def _get_time_range_data(model: Any, model_name: str) -> dict[str, str]:
+    """Get time range for a model. Returns dict with start/end ISO strings."""
+    all_dims = list(model.dimensions)
+    time_dim_name = _find_time_dimension(model, all_dims)
+
+    if not time_dim_name:
+        raise ToolError(f"Model {model_name} has no time dimension")
+
+    tbl = model.table
+    col_name = time_dim_name.split(".")[-1] if "." in time_dim_name else time_dim_name
+    time_col = tbl[col_name]
+    result = tbl.aggregate(start=time_col.min(), end=time_col.max()).execute()
+
+    return {
+        "start": result["start"].iloc[0].isoformat(),
+        "end": result["end"].iloc[0].isoformat(),
+    }
+
+
+@dataclass
+class ModelSelection:
+    """Elicitation response type for model selection."""
+
+    model_name: str
+
+
+async def _resolve_model(
+    models: Mapping[str, Any],
+    model_name: str,
+    ctx: Context | None,
+) -> Any:
+    """Resolve a model by name, using elicitation if available and model not found."""
+    if model_name in models:
+        return models[model_name]
+
+    # Try elicitation to let the user pick the correct model
+    if ctx:
+        available = list(models.keys())
+        try:
+            response = await ctx.elicit(
+                f"Model '{model_name}' not found. "
+                f"Available models: {', '.join(available)}. "
+                f"Which model did you mean?",
+                response_type=ModelSelection,
+            )
+            if response.action == "accept" and response.data:
+                picked = response.data.model_name
+                if picked in models:
+                    await ctx.info(f"Resolved to model '{picked}'")
+                    return models[picked]
+        except Exception:
+            pass  # Client doesn't support elicitation — fall through to error
+
+    raise ToolError(
+        f"Model '{model_name}' not found. "
+        f"Available models: {list(models.keys())}"
+    )
+
+
 class MCPSemanticModel(FastMCP):
     def __init__(
         self,
         models: Mapping[str, Any],
         name: str = "Semantic Layer MCP Server",
         instructions: str = SYSTEM_INSTRUCTIONS,
+        code_mode: bool = False,
         **kwargs,
     ):
-        super().__init__(name=name, instructions=instructions, **kwargs)
+        transforms = kwargs.pop("transforms", [])
+        if code_mode:
+            transforms = [*transforms, *_build_code_mode_transforms()]
+        super().__init__(
+            name=name, instructions=instructions, transforms=transforms, **kwargs
+        )
         self.models = models
         self._register_tools()
         self._register_resources()
@@ -92,7 +166,7 @@ class MCPSemanticModel(FastMCP):
             name="list_models",
             description=load_prompt(PROMPTS_DIR, "tool-list-models-desc.md"),
             tags={"discovery"},
-            annotations=ToolAnnotations(readOnlyHint=True),
+            annotations=_READONLY_ANNOTATIONS,
         )
         def list_models() -> Mapping[str, str]:
             return {name: f"Semantic model: {name}" for name in self.models}
@@ -101,51 +175,33 @@ class MCPSemanticModel(FastMCP):
             name="get_model",
             description=load_prompt(PROMPTS_DIR, "tool-get-model-desc.md"),
             tags={"discovery", "metadata"},
-            annotations=ToolAnnotations(readOnlyHint=True),
+            annotations=_READONLY_ANNOTATIONS,
         )
-        def get_model(model_name: str) -> Mapping[str, Any]:
-            if model_name not in self.models:
-                raise ToolError(f"Model {model_name} not found")
-
-            return _build_model_info(self.models[model_name])
+        async def get_model(
+            model_name: str,
+            ctx: Context | None = None,
+        ) -> Mapping[str, Any]:
+            model = await _resolve_model(self.models, model_name, ctx)
+            return _build_model_info(model)
 
         @self.tool(
             name="get_time_range",
             description=load_prompt(PROMPTS_DIR, "tool-get-time-range-desc.md"),
             tags={"metadata"},
-            annotations=ToolAnnotations(readOnlyHint=True),
+            annotations=_READONLY_ANNOTATIONS,
         )
-        def get_time_range(model_name: str) -> Mapping[str, Any]:
-            if model_name not in self.models:
-                raise ToolError(f"Model {model_name} not found")
-
-            model = self.models[model_name]
-            all_dims = list(model.dimensions)
-            time_dim_name = _find_time_dimension(model, all_dims)
-
-            if not time_dim_name:
-                raise ToolError(f"Model {model_name} has no time dimension")
-
-            # Access column directly from table to avoid Deferred recursion issue
-            # time_dim.expr(tbl) returns a Deferred object that causes infinite
-            # recursion when passed to tbl.aggregate()
-            tbl = model.table
-            # For joined models, dimension names have table prefix (e.g., 'flights.flight_date')
-            # but the actual column name is just the part after the dot ('flight_date')
-            col_name = time_dim_name.split(".")[-1] if "." in time_dim_name else time_dim_name
-            time_col = tbl[col_name]
-            result = tbl.aggregate(start=time_col.min(), end=time_col.max()).execute()
-
-            return {
-                "start": result["start"].iloc[0].isoformat(),
-                "end": result["end"].iloc[0].isoformat(),
-            }
+        async def get_time_range(
+            model_name: str,
+            ctx: Context | None = None,
+        ) -> Mapping[str, Any]:
+            model = await _resolve_model(self.models, model_name, ctx)
+            return _get_time_range_data(model, model_name)
 
         @self.tool(
             name="query_model",
             description=load_prompt(PROMPTS_DIR, "tool-query-desc.md"),
             tags={"query"},
-            annotations=ToolAnnotations(readOnlyHint=True),
+            annotations=_READONLY_ANNOTATIONS,
         )
         async def query_model(
             model_name: str,
@@ -249,8 +305,7 @@ class MCPSemanticModel(FastMCP):
             ] = None,
             ctx: Context | None = None,
         ) -> str:
-            if model_name not in self.models:
-                raise ToolError(f"Model {model_name} not found")
+            model = await _resolve_model(self.models, model_name, ctx)
 
             if ctx:
                 await ctx.info(
@@ -259,7 +314,6 @@ class MCPSemanticModel(FastMCP):
                 )
                 await ctx.report_progress(progress=10, total=100)
 
-            model = self.models[model_name]
             query_result = model.query(
                 dimensions=dimensions,
                 measures=measures,
@@ -285,6 +339,21 @@ class MCPSemanticModel(FastMCP):
             )
 
             if ctx:
+                await ctx.report_progress(progress=90, total=100)
+
+                # Store query in session state for follow-up tools
+                await ctx.set_state("last_query", {
+                    "model_name": model_name,
+                    "dimensions": dimensions,
+                    "measures": measures,
+                    "filters": filters,
+                    "order_by": order_by,
+                    "limit": limit,
+                    "time_grain": time_grain,
+                    "time_range": time_range,
+                })
+                await ctx.set_state("last_result", result)
+
                 await ctx.report_progress(progress=100, total=100)
 
             return result
@@ -293,7 +362,7 @@ class MCPSemanticModel(FastMCP):
             name="search_dimension_values",
             description=load_prompt(PROMPTS_DIR, "tool-search-dimension-values-desc.md"),
             tags={"discovery", "query"},
-            annotations=ToolAnnotations(readOnlyHint=True),
+            annotations=_READONLY_ANNOTATIONS,
         )
         async def search_dimension_values(
             model_name: str,
@@ -302,8 +371,7 @@ class MCPSemanticModel(FastMCP):
             limit: int = 20,
             ctx: Context | None = None,
         ) -> dict:
-            if model_name not in self.models:
-                raise ToolError(f"Model '{model_name}' not found")
+            model = await _resolve_model(self.models, model_name, ctx)
 
             if ctx:
                 await ctx.info(
@@ -311,14 +379,37 @@ class MCPSemanticModel(FastMCP):
                     f"for '{search_term}'"
                 )
 
-            model = self.models[model_name]
             dims = model.get_dimensions()
 
             if dimension_name not in dims:
-                raise ToolError(
-                    f"Dimension '{dimension_name}' not found in model '{model_name}'. "
-                    f"Available dimensions: {list(dims.keys())}"
-                )
+                # Try elicitation to let the user pick the correct dimension
+                resolved = False
+                if ctx:
+                    try:
+                        @dataclass
+                        class DimensionSelection:
+                            dimension_name: str
+
+                        response = await ctx.elicit(
+                            f"Dimension '{dimension_name}' not found in model "
+                            f"'{model_name}'. Available dimensions: "
+                            f"{', '.join(dims.keys())}. Which dimension did you mean?",
+                            response_type=DimensionSelection,
+                        )
+                        if response.action == "accept" and response.data:
+                            picked = response.data.dimension_name
+                            if picked in dims:
+                                dimension_name = picked
+                                resolved = True
+                                await ctx.info(f"Resolved to dimension '{picked}'")
+                    except Exception:
+                        pass  # Client doesn't support elicitation
+
+                if not resolved:
+                    raise ToolError(
+                        f"Dimension '{dimension_name}' not found in model '{model_name}'. "
+                        f"Available dimensions: {list(dims.keys())}"
+                    )
 
             dim = dims[dimension_name]
             tbl = model.table
@@ -389,12 +480,74 @@ class MCPSemanticModel(FastMCP):
                 "values": values,
             }
 
+        @self.tool(
+            name="summarize_results",
+            description=(
+                "Generate a natural-language summary of the last query results "
+                "using the connected LLM. Requires a prior query_model call in "
+                "the same session."
+            ),
+            tags={"query", "analysis"},
+            annotations=_READONLY_ANNOTATIONS,
+        )
+        async def summarize_results(
+            question: Annotated[
+                str | None,
+                Field(
+                    default=None,
+                    description="Optional question to focus the summary on",
+                ),
+            ] = None,
+            ctx: Context | None = None,
+        ) -> str:
+            if not ctx:
+                raise ToolError("summarize_results requires an MCP client with Context support")
+
+            last_result = await ctx.get_state("last_result")
+            last_query = await ctx.get_state("last_query")
+
+            if not last_result:
+                raise ToolError(
+                    "No previous query results found in this session. "
+                    "Run query_model first."
+                )
+
+            prompt_parts = [
+                "Analyze the following semantic layer query results and provide "
+                "a concise, insightful summary.",
+            ]
+            if last_query:
+                prompt_parts.append(
+                    f"\nQuery context: model={last_query.get('model_name')}, "
+                    f"dimensions={last_query.get('dimensions')}, "
+                    f"measures={last_query.get('measures')}"
+                )
+            if question:
+                prompt_parts.append(f"\nFocus on answering: {question}")
+            prompt_parts.append(f"\nResults:\n{last_result}")
+
+            try:
+                response = await ctx.sample(
+                    "\n".join(prompt_parts),
+                    system_prompt=(
+                        "You are a data analyst summarizing query results. "
+                        "Be concise and highlight key insights, trends, and outliers."
+                    ),
+                    max_tokens=1024,
+                )
+                return response.text
+            except Exception as e:
+                raise ToolError(
+                    f"LLM sampling not supported by this client: {e}"
+                ) from e
+
     def _register_resources(self):
         @self.resource(
             uri="semantic://models",
             name="Available Models",
             description="List all available semantic models",
             mime_type="application/json",
+            annotations=Annotations(audience=["assistant"], priority=1.0),
         )
         def list_models_resource() -> str:
             models_list = {}
@@ -411,6 +564,7 @@ class MCPSemanticModel(FastMCP):
             name="Model Schema",
             description="Get schema with dimensions and measures for a specific model",
             mime_type="application/json",
+            annotations=Annotations(audience=["assistant"], priority=0.8),
         )
         def get_model_resource(model_name: str) -> str:
             if model_name not in self.models:
@@ -423,6 +577,7 @@ class MCPSemanticModel(FastMCP):
             name="Model Time Range",
             description="Get date bounds for time-series models",
             mime_type="application/json",
+            annotations=Annotations(audience=["assistant"], priority=0.5),
         )
         def get_time_range_resource(model_name: str) -> str:
             if model_name not in self.models:
@@ -475,8 +630,32 @@ class MCPSemanticModel(FastMCP):
             )
 
 
+def _build_code_mode_transforms() -> list:
+    """Build CodeMode transforms. Requires fastmcp[code-mode] >= 3.1.0."""
+    try:
+        from fastmcp.experimental.transforms.code_mode import (
+            CodeMode,
+            GetSchemas,
+            GetTags,
+            Search,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "CodeMode requires the 'code-mode' extra. "
+            "Install with: pip install 'fastmcp[code-mode]>=3.1.0' "
+            "or: pip install 'boring-semantic-layer[mcp-code-mode]'"
+        ) from e
+
+    return [
+        CodeMode(
+            discovery_tools=[GetTags(), Search(), GetSchemas()],
+        )
+    ]
+
+
 def create_mcp_server(
     models: Mapping[str, Any],
     name: str = "Semantic Layer MCP Server",
+    code_mode: bool = False,
 ) -> MCPSemanticModel:
-    return MCPSemanticModel(models=models, name=name)
+    return MCPSemanticModel(models=models, name=name, code_mode=code_mode)

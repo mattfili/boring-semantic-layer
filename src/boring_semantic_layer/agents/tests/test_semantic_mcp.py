@@ -160,7 +160,7 @@ class TestGetModel:
         mcp = MCPSemanticModel(models=sample_models)
 
         async with Client(mcp) as client:
-            with pytest.raises(ToolError, match="Model nonexistent not found"):
+            with pytest.raises(ToolError, match="Model 'nonexistent' not found"):
                 await client.call_tool("get_model", {"model_name": "nonexistent"})
 
 
@@ -196,7 +196,7 @@ class TestGetTimeRange:
         mcp = MCPSemanticModel(models=sample_models)
 
         async with Client(mcp) as client:
-            with pytest.raises(ToolError, match="Model nonexistent not found"):
+            with pytest.raises(ToolError, match="Model 'nonexistent' not found"):
                 await client.call_tool("get_time_range", {"model_name": "nonexistent"})
 
 
@@ -884,6 +884,7 @@ class TestToolTagsAndAnnotations:
             "get_time_range": {"metadata"},
             "query_model": {"query"},
             "search_dimension_values": {"discovery", "query"},
+            "summarize_results": {"query", "analysis"},
         }
 
         async with Client(mcp) as client:
@@ -895,8 +896,8 @@ class TestToolTagsAndAnnotations:
                 assert tool_map[tool_name].annotations is not None
 
     @pytest.mark.asyncio
-    async def test_five_tools_registered(self, sample_models):
-        """Test that exactly 5 tools are registered."""
+    async def test_six_tools_registered(self, sample_models):
+        """Test that exactly 6 tools are registered."""
         mcp = MCPSemanticModel(models=sample_models)
 
         async with Client(mcp) as client:
@@ -908,6 +909,7 @@ class TestToolTagsAndAnnotations:
                 "get_time_range",
                 "query_model",
                 "search_dimension_values",
+                "summarize_results",
             }
             assert tool_names == expected
 
@@ -1023,3 +1025,146 @@ class TestMCPPrompts:
             result = await client.get_prompt("model_exploration_guide")
             assert len(result.messages) > 0
             assert len(result.messages[0].content.text) > 0
+
+
+class TestCompleteToolAnnotations:
+    """Test that ToolAnnotations include all FastMCP 3.0 fields."""
+
+    @pytest.mark.asyncio
+    async def test_all_tools_have_full_annotations(self, sample_models):
+        """Test that all tools have destructiveHint, idempotentHint, openWorldHint."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+            for tool in tools:
+                ann = tool.annotations
+                assert ann is not None, f"{tool.name} missing annotations"
+                assert ann.readOnlyHint is True, f"{tool.name}: readOnlyHint"
+                assert ann.destructiveHint is False, f"{tool.name}: destructiveHint"
+                assert ann.idempotentHint is True, f"{tool.name}: idempotentHint"
+                assert ann.openWorldHint is False, f"{tool.name}: openWorldHint"
+
+
+class TestResourceAnnotations:
+    """Test that MCP resources have audience/priority annotations."""
+
+    @pytest.mark.asyncio
+    async def test_resources_have_annotations(self, sample_models):
+        """Test that resources include Annotations with audience and priority."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            resources = await client.list_resources()
+
+            # The static resource (semantic://models) should be in resources
+            static_uris = {r.uri for r in resources}
+            assert "semantic://models" in {str(u) for u in static_uris}
+
+            # All resources should have annotations
+            for r in resources:
+                assert r.annotations is not None, f"Resource {r.uri} missing annotations"
+                assert "assistant" in r.annotations.audience
+
+
+class TestSummarizeResultsTool:
+    """Test the summarize_results tool (ctx.sample + ctx.get_state)."""
+
+    @pytest.mark.asyncio
+    async def test_summarize_without_prior_query_fails(self, sample_models):
+        """Test that summarize_results fails when no prior query exists."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="No previous query results"):
+                await client.call_tool("summarize_results", {})
+
+    @pytest.mark.asyncio
+    async def test_summarize_results_listed(self, sample_models):
+        """Test that summarize_results appears in tool listing."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+            names = {t.name for t in tools}
+            assert "summarize_results" in names
+
+    @pytest.mark.asyncio
+    async def test_summarize_results_has_question_param(self, sample_models):
+        """Test that summarize_results accepts an optional question parameter."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+            tool = next(t for t in tools if t.name == "summarize_results")
+            schema = tool.inputSchema
+            assert "question" in schema.get("properties", {})
+
+
+class TestCodeModeSupport:
+    """Test CodeMode integration."""
+
+    @pytest.mark.asyncio
+    async def test_default_no_code_mode(self, sample_models):
+        """Test that code_mode=False (default) works without code-mode extra."""
+        mcp = MCPSemanticModel(models=sample_models)
+        # Server should instantiate without transforms
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+            assert len(tools) == 6
+
+    @pytest.mark.asyncio
+    async def test_code_mode_import_error_message(self, sample_models):
+        """Test that code_mode=True gives helpful error if extra not installed."""
+        import unittest.mock as mock
+
+        with mock.patch.dict("sys.modules", {"fastmcp.experimental": None}):
+            try:
+                MCPSemanticModel(models=sample_models, code_mode=True)
+                # If it succeeds (extra is installed), that's fine too
+            except ImportError as e:
+                assert "code-mode" in str(e).lower()
+
+    def test_build_code_mode_transforms_returns_list(self):
+        """Test _build_code_mode_transforms returns a list (if extra installed)."""
+        from boring_semantic_layer.agents.backends.mcp import _build_code_mode_transforms
+
+        try:
+            transforms = _build_code_mode_transforms()
+            assert isinstance(transforms, list)
+            assert len(transforms) > 0
+        except ImportError:
+            pytest.skip("fastmcp[code-mode] not installed")
+
+
+class TestElicitModelResolution:
+    """Test _resolve_model elicitation fallback (without real client elicit)."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_known_model(self, sample_models):
+        """Test _resolve_model returns model directly when name matches."""
+        from boring_semantic_layer.agents.backends.mcp import _resolve_model
+
+        model = await _resolve_model(sample_models, "flights", None)
+        assert model.name == "flights"
+
+    @pytest.mark.asyncio
+    async def test_resolve_unknown_model_no_ctx(self, sample_models):
+        """Test _resolve_model raises ToolError when model not found and no ctx."""
+        from boring_semantic_layer.agents.backends.mcp import _resolve_model
+
+        with pytest.raises(ToolError, match="Model 'unknown' not found"):
+            await _resolve_model(sample_models, "unknown", None)
+
+    @pytest.mark.asyncio
+    async def test_resolve_unknown_model_with_ctx_no_elicit(self, sample_models):
+        """Test _resolve_model raises ToolError when elicitation fails/unavailable."""
+        from unittest.mock import AsyncMock
+
+        from boring_semantic_layer.agents.backends.mcp import _resolve_model
+
+        mock_ctx = AsyncMock()
+        mock_ctx.elicit = AsyncMock(side_effect=Exception("not supported"))
+
+        with pytest.raises(ToolError, match="Model 'unknown' not found"):
+            await _resolve_model(sample_models, "unknown", mock_ctx)

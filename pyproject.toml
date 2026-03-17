@@ -42,6 +42,11 @@ mcp = [
     "fastmcp>=3.0.0",
 ]
 
+# MCP server with CodeMode (experimental sandbox for LLM-driven tool chaining)
+mcp-code-mode = [
+    "fastmcp[code-mode]>=3.1.0",
+]
+
 dev = [
     "boring-semantic-layer[agent,mcp,examples,viz-altair,viz-plotly,viz-plotext]",
     "openai>=1.0.0",

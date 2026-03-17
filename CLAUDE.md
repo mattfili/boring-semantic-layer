@@ -124,19 +124,30 @@ YAML expressions use `_.column` syntax (Deferred), parsed through `safe_eval()` 
 ## MCP Server (FastMCP 3.0)
 
 `MCPSemanticModel` subclasses `FastMCP` and registers:
-- **5 tools**: `list_models`, `get_model`, `get_time_range`, `query_model`, `search_dimension_values`
-- **3 resources**: `semantic://models`, `semantic://models/{name}`, `semantic://models/{name}/time-range`
+- **6 tools**: `list_models`, `get_model`, `get_time_range`, `query_model`, `search_dimension_values`, `summarize_results`
+- **3 resources**: `semantic://models`, `semantic://models/{name}`, `semantic://models/{name}/time-range` — all with `Annotations(audience=["assistant"], priority=...)` from `mcp.types`
 - **3 prompts**: `query_guide`, `model_exploration_guide`, `getting_started`
 
 All tool descriptions load from `docs/md/prompts/query/mcp/*.md` (23 files). These are bundled into the wheel via `shared-data`.
 
-Tools use `ToolError` (not `ValueError`) for MCP error propagation. `query_model` and `search_dimension_values` are `async` with `ctx: Context` for structured logging/progress.
+### FastMCP 3.0+ Features
+
+- **ToolError**: All tools raise `ToolError` (from `fastmcp.exceptions`) instead of `ValueError` for proper MCP error propagation
+- **ToolAnnotations**: Every tool has `readOnlyHint=True`, `destructiveHint=False`, `idempotentHint=True`, `openWorldHint=False` via shared `_READONLY_ANNOTATIONS` constant
+- **Tool Tags**: `{"discovery"}`, `{"metadata"}`, `{"query"}`, `{"analysis"}` — used for tool categorization
+- **Context integration**: `ctx: Context | None = None` on `get_model`, `get_time_range`, `query_model`, `search_dimension_values`, `summarize_results` — provides `ctx.info()`, `ctx.report_progress()`
+- **Session state**: `query_model` stores `last_query` and `last_result` via `ctx.set_state()`; `summarize_results` reads them via `ctx.get_state()`
+- **ctx.elicit()**: `_resolve_model()` and `search_dimension_values` try interactive model/dimension resolution via elicitation before raising `ToolError` — gracefully degrades when client doesn't support it
+- **ctx.sample()**: `summarize_results` tool uses `ctx.sample()` to generate NL summaries of query results via the connected LLM
+- **Resource annotations**: All resources have `Annotations(audience=["assistant"], priority=float)` from `mcp.types`
+- **CodeMode**: Optional `code_mode=True` constructor parameter — requires `fastmcp[code-mode]>=3.1.0` (install via `boring-semantic-layer[mcp-code-mode]`). Uses `_build_code_mode_transforms()` factory with `GetTags`, `Search`, `GetSchemas` discovery tools
 
 ## Optional Dependencies
 
 | Extra | What it provides | Gated feature |
 |-------|-----------------|---------------|
 | `mcp` | `fastmcp>=3.0.0` | `MCPSemanticModel` |
+| `mcp-code-mode` | `fastmcp[code-mode]>=3.1.0` | CodeMode transforms |
 | `agent` | langchain, rich, plotext | `LangGraphBackend`, CLI |
 | `viz-altair` | altair, vl-convert | Altair chart backend |
 | `viz-plotly` | plotly, kaleido | Plotly chart backend |
