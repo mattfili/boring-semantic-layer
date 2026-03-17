@@ -429,22 +429,25 @@ class MCPSemanticModel(FastMCP):
             # Total distinct count (before applying search filter)
             total_distinct = int(agg.count().execute())
 
-            def _to_value_list(df):
-                return [
-                    {"value": str(row["_value"]), "count": int(row["frequency"])}
-                    for _, row in df.iterrows()
-                ]
-
             def _fetch(base_agg, n):
                 """Fetch top n+1 rows and return (values_list, is_complete).
 
-                Executes the aggregation first, then sorts in pandas — ibis
+                Executes via pyarrow, then sorts there — ibis
                 order_by().limit() can hit infinite recursion on joined models.
                 """
-                df = base_agg.execute()
-                df = df.sort_values("frequency", ascending=False).head(n + 1)
-                complete = len(df) <= n
-                return _to_value_list(df.head(n)), complete
+                tbl_pa = base_agg.to_pyarrow()
+                sorted_pa = tbl_pa.sort_by([("frequency", "descending")])
+                top = sorted_pa.slice(0, n + 1)
+                complete = top.num_rows <= n
+                result = top.slice(0, n)
+                values = [
+                    {
+                        "value": str(result.column("_value")[i].as_py()),
+                        "count": int(result.column("frequency")[i].as_py()),
+                    }
+                    for i in range(result.num_rows)
+                ]
+                return values, complete
 
             _SEP = r"[\s\-_.,]+"
 
