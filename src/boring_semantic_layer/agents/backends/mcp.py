@@ -411,9 +411,11 @@ class MCPSemanticModel(FastMCP):
                         f"Available dimensions: {list(dims.keys())}"
                     )
 
-            dim = dims[dimension_name]
             tbl = model.table
-            col_expr = dim(tbl)
+            # Access column directly — dim(tbl) returns a Deferred on joined
+            # models which causes infinite recursion in .select()
+            col_name = dimension_name.split(".")[-1] if "." in dimension_name else dimension_name
+            col_expr = tbl[col_name]
 
             # Aggregate by value to get frequency counts
             agg = (
@@ -434,13 +436,13 @@ class MCPSemanticModel(FastMCP):
                 ]
 
             def _fetch(base_agg, n):
-                """Fetch top n+1 rows and return (values_list, is_complete)."""
-                df = (
-                    base_agg
-                    .order_by(ibis.desc("frequency"))
-                    .limit(n + 1)
-                    .execute()
-                )
+                """Fetch top n+1 rows and return (values_list, is_complete).
+
+                Executes the aggregation first, then sorts in pandas — ibis
+                order_by().limit() can hit infinite recursion on joined models.
+                """
+                df = base_agg.execute()
+                df = df.sort_values("frequency", ascending=False).head(n + 1)
                 complete = len(df) <= n
                 return _to_value_list(df.head(n)), complete
 

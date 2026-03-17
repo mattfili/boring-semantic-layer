@@ -41,12 +41,16 @@ src/boring_semantic_layer/
 ├── convert.py              # @convert.register — lower SemanticOps → ibis expressions
 ├── format.py               # @fmt.register — pretty printing
 ├── utils.py                # safe_eval() for YAML expressions (AST-validated, no exec)
+├── nested_access.py        # Malloy-style automatic nested array access
+├── projection_utils.py     # Projection pushdown, TableRequirements
 ├── serialization/          # to_tagged/from_tagged — xorq roundtrip serialization
-├── chart/                  # 4 viz backends: altair, plotly, plotext, echarts
+├── chart/                  # 5 viz backends: altair, plotly, plotext, echarts, md_parser
 │   ├── base.py             # ChartBackend ABC
 │   ├── altair_chart.py     # Vega-Lite JSON specs
 │   ├── plotly_chart.py     # Interactive/3D charts
 │   ├── plotext_chart.py    # Terminal charts (CLI default)
+│   ├── echarts/            # ECharts backend (backend.py, interface.py, types.py)
+│   ├── echarts_adapter.py  # ECharts adapter layer
 │   └── md_parser/          # Dashboard markdown → executed queries
 ├── agents/
 │   ├── backends/
@@ -55,7 +59,8 @@ src/boring_semantic_layer/
 │   ├── tools.py            # BSLTools — shared tool definitions for both backends
 │   ├── utils/
 │   │   ├── prompts.py      # load_prompt() — loads markdown files
-│   │   └── chart_handler.py # generate_chart_with_data() — records + chart output
+│   │   ├── chart_handler.py # generate_chart_with_data() — records + chart output
+│   │   └── tokens.py       # Token counting utilities
 │   ├── cli.py              # `bsl` CLI entry point
 │   └── tests/              # Canonical test location for MCP + agent tests
 └── tests/                  # Core semantic layer tests (40+ files)
