@@ -1100,6 +1100,30 @@ class TestSummarizeResultsTool:
             schema = tool.inputSchema
             assert "question" in schema.get("properties", {})
 
+    @pytest.mark.asyncio
+    async def test_summarize_returns_fallback_when_sampling_unavailable(self, sample_models):
+        """summarize_results should return prompt text (not raise) when ctx.sample() fails."""
+        mcp = MCPSemanticModel(models=sample_models)
+
+        async with Client(mcp) as client:
+            # First, run a query to populate session state
+            await client.call_tool(
+                "query_model",
+                {
+                    "model_name": "flights",
+                    "dimensions": ["carrier"],
+                    "measures": ["flight_count"],
+                },
+            )
+
+            # The test Client doesn't support sampling, so ctx.sample() will
+            # raise. The tool should fall back to returning the prompt text.
+            result = await client.call_tool("summarize_results", {})
+            text = result.content[0].text
+            assert isinstance(text, str)
+            assert "Analyze the following semantic layer query results" in text
+            assert "Results:" in text
+
 
 class TestCodeModeSupport:
     """Test CodeMode integration."""

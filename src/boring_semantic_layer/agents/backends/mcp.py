@@ -541,10 +541,8 @@ class MCPSemanticModel(FastMCP):
                     max_tokens=1024,
                 )
                 return response.text
-            except Exception as e:
-                raise ToolError(
-                    f"LLM sampling not supported by this client: {e}"
-                ) from e
+            except Exception:
+                return "\n".join(prompt_parts)
 
     def _register_resources(self):
         @self.resource(
