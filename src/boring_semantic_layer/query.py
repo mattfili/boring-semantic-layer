@@ -214,6 +214,14 @@ class Filter:
         if not isinstance(value, str):
             return value
 
+        # Only attempt date/timestamp parsing if the string contains a date
+        # separator. Without this guard, dateutil parses bare numbers like "15",
+        # "99", or "2024" as dates, breaking string-typed column filters.
+        import re
+
+        if not re.search(r"[-/T]", value):
+            return value
+
         # Try parsing as timestamp first (more general), then date
         for dtype in ("timestamp", "date"):
             try:
@@ -434,14 +442,18 @@ def _build_post_agg_predicate(filter_obj: dict) -> Any:
         return OPERATOR_MAPPING[op](field_expr, filter_obj.get("values", []))
 
     value = filter_obj.get("value")
-    # Convert date/timestamp strings
+    # Convert date/timestamp strings — only if the string contains a date
+    # separator to avoid dateutil parsing bare numbers as dates.
     if isinstance(value, str):
-        for dtype in ("timestamp", "date"):
-            try:
-                value = ibis.literal(value, type=dtype)
-                break
-            except (ValueError, TypeError):
-                pass
+        import re
+
+        if re.search(r"[-/T]", value):
+            for dtype in ("timestamp", "date"):
+                try:
+                    value = ibis.literal(value, type=dtype)
+                    break
+                except (ValueError, TypeError):
+                    pass
     return OPERATOR_MAPPING[op](field_expr, value)
 
 

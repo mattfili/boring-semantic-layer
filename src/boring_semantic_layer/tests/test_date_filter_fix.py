@@ -285,6 +285,31 @@ class TestFilterValueConversion:
         assert result == "USA"
         assert isinstance(result, str)
 
+    @pytest.mark.parametrize(
+        "value",
+        ["15", "02", "99", "2024", "100", "20240115", "15.5", "501c3"],
+        ids=lambda v: f"numeric_string_{v}",
+    )
+    def test_numeric_looking_strings_passthrough(self, value):
+        """Numeric-looking strings must not be coerced to timestamps."""
+        f = Filter(filter={"field": "x", "operator": "=", "value": value})
+        result = f._convert_filter_value(value)
+        assert result == value
+        assert isinstance(result, str)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["2024-01-15", "01/15/2024"],
+        ids=lambda v: f"date_string_{v}",
+    )
+    def test_date_strings_still_parse(self, value):
+        """Strings with date separators should still parse as timestamps."""
+        from xorq.vendor.ibis.expr.types.temporal import TimestampScalar as XTimestampScalar
+
+        f = Filter(filter={"field": "x", "operator": "=", "value": value})
+        result = f._convert_filter_value(value)
+        assert isinstance(result, (ibis.expr.types.temporal.TimestampScalar, XTimestampScalar))
+
     def test_numeric_passthrough(self):
         """Test that numeric values pass through unchanged."""
         f = Filter(filter={"field": "x", "operator": "=", "value": 123})
