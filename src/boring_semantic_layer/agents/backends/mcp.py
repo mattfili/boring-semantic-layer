@@ -429,6 +429,12 @@ class MCPSemanticModel(FastMCP):
             # Total distinct count (before applying search filter)
             total_distinct = int(agg.count().execute())
 
+            def _json_safe(val):
+                """Preserve JSON-serializable types; str() everything else."""
+                if val is None or isinstance(val, (bool, int, float, str)):
+                    return val
+                return str(val)
+
             def _fetch(base_agg, n):
                 """Fetch top n+1 rows and return (values_list, is_complete).
 
@@ -442,7 +448,7 @@ class MCPSemanticModel(FastMCP):
                 result = top.slice(0, n)
                 values = [
                     {
-                        "value": str(result.column("_value")[i].as_py()),
+                        "value": _json_safe(result.column("_value")[i].as_py()),
                         "count": int(result.column("frequency")[i].as_py()),
                     }
                     for i in range(result.num_rows)

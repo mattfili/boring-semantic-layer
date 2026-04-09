@@ -857,6 +857,46 @@ class TestSearchDimensionValues:
                 assert item["count"] > 0
 
 
+class TestSearchDimensionValuesBooleans:
+    """Test that boolean dimension values are preserved as JSON booleans."""
+
+    @pytest.mark.asyncio
+    async def test_boolean_values_not_stringified(self):
+        """search_dimension_values should return true/false, not 'True'/'False'."""
+        con = ibis.duckdb.connect(":memory:")
+        tbl = con.create_table(
+            "orgs_bool",
+            pd.DataFrame(
+                {
+                    "name": ["Org A", "Org B", "Org C", "Org D"],
+                    "is_private": [True, False, True, False],
+                }
+            ),
+        )
+        model = (
+            to_semantic_table(tbl, name="orgs")
+            .with_dimensions(
+                name=lambda t: t.name,
+                is_private=lambda t: t.is_private,
+            )
+            .with_measures(org_count=lambda t: t.count())
+        )
+        mcp = MCPSemanticModel(models={"orgs": model})
+
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "search_dimension_values",
+                {"model_name": "orgs", "dimension_name": "is_private"},
+            )
+            data = json.loads(result.content[0].text)
+            values = [item["value"] for item in data["values"]]
+
+            assert True in values
+            assert False in values
+            assert "True" not in values
+            assert "False" not in values
+
+
 class TestToolTagsAndAnnotations:
     """Test that tools have proper tags and annotations (FastMCP 3.0)."""
 
