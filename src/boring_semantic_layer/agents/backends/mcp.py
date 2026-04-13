@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
-import ibis
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
@@ -14,11 +13,13 @@ from mcp.types import Annotations, ToolAnnotations
 from pydantic import Field
 from pydantic.functional_validators import BeforeValidator
 
-from ...query import _find_time_dimension
+from ...query import _find_time_dimension as find_time_dimension
 from ..utils.chart_handler import generate_chart_with_data
 from ..utils.prompts import load_prompt
 
 load_dotenv()
+
+_find_time_dimension = find_time_dimension  # backwards-compat alias
 
 
 def _get_prompts_dir() -> Path:
@@ -38,12 +39,13 @@ PROMPTS_DIR = _get_prompts_dir()
 SYSTEM_INSTRUCTIONS = load_prompt(PROMPTS_DIR, "system.md") or "MCP server for semantic models"
 
 # Shared annotations — all tools are read-only, idempotent, and operate on a closed model set
-_READONLY_ANNOTATIONS = ToolAnnotations(
+READONLY_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=False,
 )
+_READONLY_ANNOTATIONS = READONLY_ANNOTATIONS  # backwards-compat alias
 
 
 def _parse_json_string(v: Any) -> Any:
@@ -83,9 +85,13 @@ def _build_model_info(model: Any) -> dict[str, Any]:
 
 
 def _get_time_range_data(model: Any, model_name: str) -> dict[str, str]:
-    """Get time range for a model. Returns dict with start/end ISO strings."""
+    """Get time range for a model. Returns dict with start/end as strings.
+
+    Uses isoformat() for datetime-like values (dates, timestamps) and str()
+    for scalar types like int (e.g. tax_year, fiscal_year).
+    """
     all_dims = list(model.dimensions)
-    time_dim_name = _find_time_dimension(model, all_dims)
+    time_dim_name = find_time_dimension(model, all_dims)
 
     if not time_dim_name:
         raise ToolError(f"Model {model_name} has no time dimension")
@@ -95,9 +101,11 @@ def _get_time_range_data(model: Any, model_name: str) -> dict[str, str]:
     time_col = tbl[col_name]
     result = tbl.aggregate(start=time_col.min(), end=time_col.max()).execute()
 
+    start_val = result["start"].iloc[0]
+    end_val = result["end"].iloc[0]
     return {
-        "start": result["start"].iloc[0].isoformat(),
-        "end": result["end"].iloc[0].isoformat(),
+        "start": start_val.isoformat() if hasattr(start_val, "isoformat") else str(start_val),
+        "end": end_val.isoformat() if hasattr(end_val, "isoformat") else str(end_val),
     }
 
 
@@ -108,7 +116,7 @@ class ModelSelection:
     model_name: str
 
 
-async def _resolve_model(
+async def resolve_model(
     models: Mapping[str, Any],
     model_name: str,
     ctx: Context | None,
@@ -135,10 +143,10 @@ async def _resolve_model(
         except Exception:
             pass  # Client doesn't support elicitation — fall through to error
 
-    raise ToolError(
-        f"Model '{model_name}' not found. "
-        f"Available models: {list(models.keys())}"
-    )
+    raise ToolError(f"Model '{model_name}' not found. Available models: {list(models.keys())}")
+
+
+_resolve_model = resolve_model  # backwards-compat alias
 
 
 class MCPSemanticModel(FastMCP):
@@ -153,9 +161,7 @@ class MCPSemanticModel(FastMCP):
         transforms = kwargs.pop("transforms", [])
         if code_mode:
             transforms = [*transforms, *_build_code_mode_transforms()]
-        super().__init__(
-            name=name, instructions=instructions, transforms=transforms, **kwargs
-        )
+        super().__init__(name=name, instructions=instructions, transforms=transforms, **kwargs)
         self.models = models
         self._register_tools()
         self._register_resources()
@@ -166,7 +172,7 @@ class MCPSemanticModel(FastMCP):
             name="list_models",
             description=load_prompt(PROMPTS_DIR, "tool-list-models-desc.md"),
             tags={"discovery"},
-            annotations=_READONLY_ANNOTATIONS,
+            annotations=READONLY_ANNOTATIONS,
         )
         def list_models() -> Mapping[str, str]:
             return {name: f"Semantic model: {name}" for name in self.models}
@@ -175,33 +181,33 @@ class MCPSemanticModel(FastMCP):
             name="get_model",
             description=load_prompt(PROMPTS_DIR, "tool-get-model-desc.md"),
             tags={"discovery", "metadata"},
-            annotations=_READONLY_ANNOTATIONS,
+            annotations=READONLY_ANNOTATIONS,
         )
         async def get_model(
             model_name: str,
             ctx: Context | None = None,
         ) -> Mapping[str, Any]:
-            model = await _resolve_model(self.models, model_name, ctx)
+            model = await resolve_model(self.models, model_name, ctx)
             return _build_model_info(model)
 
         @self.tool(
             name="get_time_range",
             description=load_prompt(PROMPTS_DIR, "tool-get-time-range-desc.md"),
             tags={"metadata"},
-            annotations=_READONLY_ANNOTATIONS,
+            annotations=READONLY_ANNOTATIONS,
         )
         async def get_time_range(
             model_name: str,
             ctx: Context | None = None,
         ) -> Mapping[str, Any]:
-            model = await _resolve_model(self.models, model_name, ctx)
+            model = await resolve_model(self.models, model_name, ctx)
             return _get_time_range_data(model, model_name)
 
         @self.tool(
             name="query_model",
             description=load_prompt(PROMPTS_DIR, "tool-query-desc.md"),
             tags={"query"},
-            annotations=_READONLY_ANNOTATIONS,
+            annotations=READONLY_ANNOTATIONS,
         )
         async def query_model(
             model_name: str,
@@ -305,12 +311,11 @@ class MCPSemanticModel(FastMCP):
             ] = None,
             ctx: Context | None = None,
         ) -> str:
-            model = await _resolve_model(self.models, model_name, ctx)
+            model = await resolve_model(self.models, model_name, ctx)
 
             if ctx:
                 await ctx.info(
-                    f"Querying model '{model_name}': "
-                    f"dims={dimensions}, measures={measures}"
+                    f"Querying model '{model_name}': dims={dimensions}, measures={measures}"
                 )
                 await ctx.report_progress(progress=10, total=100)
 
@@ -342,16 +347,19 @@ class MCPSemanticModel(FastMCP):
                 await ctx.report_progress(progress=90, total=100)
 
                 # Store query in session state for follow-up tools
-                await ctx.set_state("last_query", {
-                    "model_name": model_name,
-                    "dimensions": dimensions,
-                    "measures": measures,
-                    "filters": filters,
-                    "order_by": order_by,
-                    "limit": limit,
-                    "time_grain": time_grain,
-                    "time_range": time_range,
-                })
+                await ctx.set_state(
+                    "last_query",
+                    {
+                        "model_name": model_name,
+                        "dimensions": dimensions,
+                        "measures": measures,
+                        "filters": filters,
+                        "order_by": order_by,
+                        "limit": limit,
+                        "time_grain": time_grain,
+                        "time_range": time_range,
+                    },
+                )
                 await ctx.set_state("last_result", result)
 
                 await ctx.report_progress(progress=100, total=100)
@@ -362,7 +370,7 @@ class MCPSemanticModel(FastMCP):
             name="search_dimension_values",
             description=load_prompt(PROMPTS_DIR, "tool-search-dimension-values-desc.md"),
             tags={"discovery", "query"},
-            annotations=_READONLY_ANNOTATIONS,
+            annotations=READONLY_ANNOTATIONS,
         )
         async def search_dimension_values(
             model_name: str,
@@ -371,12 +379,11 @@ class MCPSemanticModel(FastMCP):
             limit: int = 20,
             ctx: Context | None = None,
         ) -> dict:
-            model = await _resolve_model(self.models, model_name, ctx)
+            model = await resolve_model(self.models, model_name, ctx)
 
             if ctx:
                 await ctx.info(
-                    f"Searching '{dimension_name}' in '{model_name}' "
-                    f"for '{search_term}'"
+                    f"Searching '{dimension_name}' in '{model_name}' for '{search_term}'"
                 )
 
             dims = model.get_dimensions()
@@ -386,6 +393,7 @@ class MCPSemanticModel(FastMCP):
                 resolved = False
                 if ctx:
                     try:
+
                         @dataclass
                         class DimensionSelection:
                             dimension_name: str
@@ -419,8 +427,7 @@ class MCPSemanticModel(FastMCP):
 
             # Aggregate by value to get frequency counts
             agg = (
-                tbl
-                .select(col_expr.name("_value"))
+                tbl.select(col_expr.name("_value"))
                 .filter(lambda t: t["_value"].notnull())
                 .group_by("_value")
                 .aggregate(frequency=lambda t: t.count())
@@ -462,8 +469,11 @@ class MCPSemanticModel(FastMCP):
                 search_normalized = re.sub(_SEP, " ", search_term.lower()).strip()
                 filtered_agg = agg.filter(
                     lambda t: (
-                        t["_value"].cast("string").lower()
-                        .re_replace(_SEP, " ").strip()
+                        t["_value"]
+                        .cast("string")
+                        .lower()
+                        .re_replace(_SEP, " ")
+                        .strip()
                         .contains(search_normalized)
                     )
                 )
@@ -499,7 +509,7 @@ class MCPSemanticModel(FastMCP):
                 "the same session."
             ),
             tags={"query", "analysis"},
-            annotations=_READONLY_ANNOTATIONS,
+            annotations=READONLY_ANNOTATIONS,
         )
         async def summarize_results(
             question: Annotated[
@@ -519,8 +529,7 @@ class MCPSemanticModel(FastMCP):
 
             if not last_result:
                 raise ToolError(
-                    "No previous query results found in this session. "
-                    "Run query_model first."
+                    "No previous query results found in this session. Run query_model first."
                 )
 
             prompt_parts = [
@@ -594,7 +603,7 @@ class MCPSemanticModel(FastMCP):
 
             model = self.models[model_name]
             all_dims = list(model.dimensions)
-            time_dim_name = _find_time_dimension(model, all_dims)
+            time_dim_name = find_time_dimension(model, all_dims)
 
             if not time_dim_name:
                 return json.dumps({"error": f"Model {model_name} has no time dimension"})
@@ -604,11 +613,17 @@ class MCPSemanticModel(FastMCP):
             time_col = tbl[col_name]
             result = tbl.aggregate(start=time_col.min(), end=time_col.max()).execute()
 
-            return json.dumps({
-                "model": model_name,
-                "start": result["start"].iloc[0].isoformat(),
-                "end": result["end"].iloc[0].isoformat(),
-            })
+            start_val = result["start"].iloc[0]
+            end_val = result["end"].iloc[0]
+            return json.dumps(
+                {
+                    "model": model_name,
+                    "start": start_val.isoformat()
+                    if hasattr(start_val, "isoformat")
+                    else str(start_val),
+                    "end": end_val.isoformat() if hasattr(end_val, "isoformat") else str(end_val),
+                }
+            )
 
     def _register_prompts(self):
         @self.prompt(
@@ -633,10 +648,7 @@ class MCPSemanticModel(FastMCP):
             description="Semantic layer overview and usage guidelines",
         )
         def getting_started() -> str:
-            return (
-                load_prompt(PROMPTS_DIR, "system.md")
-                or "Getting started guide not available."
-            )
+            return load_prompt(PROMPTS_DIR, "system.md") or "Getting started guide not available."
 
 
 def _build_code_mode_transforms() -> list:

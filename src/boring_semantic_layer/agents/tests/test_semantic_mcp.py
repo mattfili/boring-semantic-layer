@@ -1232,3 +1232,70 @@ class TestElicitModelResolution:
 
         with pytest.raises(ToolError, match="Model 'unknown' not found"):
             await _resolve_model(sample_models, "unknown", mock_ctx)
+
+
+class TestIntegerTimeDimension:
+    """Integer time dimensions (tax_year, fiscal_year) must not crash on isoformat."""
+
+    @pytest.fixture(scope="class")
+    def int_time_model(self, con):
+        df = pd.DataFrame(
+            {
+                "tax_year": [2020, 2021, 2022, 2023, 2024],
+                "revenue": [100, 110, 120, 130, 140],
+            },
+        )
+        tbl = con.create_table("tax_filings_intyr", df, overwrite=True)
+        return (
+            to_semantic_table(tbl, name="tax_filings")
+            .with_dimensions(
+                tax_year={
+                    "expr": lambda t: t.tax_year,
+                    "description": "Tax year",
+                    "is_time_dimension": True,
+                    "smallest_time_grain": "year",
+                },
+            )
+            .with_measures(
+                total_revenue={"expr": lambda t: t.revenue.sum()},
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_time_range_tool_with_int_dim(self, int_time_model):
+        """Tool path must coerce int time values to str (no isoformat)."""
+        mcp = MCPSemanticModel(models={"tax_filings": int_time_model})
+
+        async with Client(mcp) as client:
+            result = await client.call_tool("get_time_range", {"model_name": "tax_filings"})
+            payload = json.loads(result.content[0].text)
+
+            assert payload == {"start": "2020", "end": "2024"}
+
+    @pytest.mark.asyncio
+    async def test_get_time_range_resource_with_int_dim(self, int_time_model):
+        """Resource path must coerce int time values to str (no isoformat)."""
+        mcp = MCPSemanticModel(models={"tax_filings": int_time_model})
+
+        async with Client(mcp) as client:
+            result = await client.read_resource("semantic://models/tax_filings/time-range")
+            payload = json.loads(result[0].text)
+
+            assert payload["start"] == "2020"
+            assert payload["end"] == "2024"
+            assert payload["model"] == "tax_filings"
+
+    def test_backwards_compat_aliases(self):
+        """Underscore-prefixed names must remain importable and alias the public names."""
+        from boring_semantic_layer.agents.backends.mcp import (
+            _READONLY_ANNOTATIONS,
+            READONLY_ANNOTATIONS,
+            _find_time_dimension,
+            _resolve_model,
+            find_time_dimension,
+            resolve_model,
+        )
+
+        assert _READONLY_ANNOTATIONS is READONLY_ANNOTATIONS
+        assert _resolve_model is resolve_model
+        assert _find_time_dimension is find_time_dimension
