@@ -471,6 +471,23 @@ def _extract_missing_column_name(exc: Exception) -> str | None:
     return None
 
 
+def _is_identity_passthrough(dim, dim_name: str, base_tbl: ir.Table) -> bool:
+    """True iff `dim`'s expression is `base_tbl[dim_name]` — i.e., a raw
+    column reference, not a computed expression or rename.
+
+    Skipping these in filter-time enrichment avoids O(N^2) ibis tree growth
+    on models with many dimensions; the Resolver handles name lookups on
+    demand for whatever the predicate actually references.
+    """
+    if dim_name not in base_tbl.columns:
+        return False
+    try:
+        resolved = dim(base_tbl)
+        return resolved.op() == base_tbl[dim_name].op()
+    except (AttributeError, TypeError, KeyError):
+        return False
+
+
 def _mutate_dimensions_with_dependencies(
     tbl: ir.Table,
     dimension_names: Iterable[str],
@@ -1104,10 +1121,14 @@ class SemanticFilterOp(Relation):
 
         # Enrich table with derived dimensions so multi-level deps
         # (e.g. d_two -> d_one -> distance) resolve correctly in filters.
-        # Best-effort: skip dimensions whose columns aren't available yet
-        # (e.g. join-based dims); those resolve through the Resolver fallback.
+        # Skip raw passthroughs (`lambda t: t[col]`): they already exist on
+        # base_tbl, and enriching each one is O(N) in the ibis tree — the loop
+        # becomes O(N^2) for models with many dims. Derived/renamed dims still
+        # go through the enrichment path.
         enriched = base_tbl
-        for dim_name in dim_map:
+        for dim_name, dim in dim_map.items():
+            if _is_identity_passthrough(dim, dim_name, enriched):
+                continue
             try:
                 enriched = _mutate_dimensions_with_dependencies(
                     enriched, [dim_name], dim_map
