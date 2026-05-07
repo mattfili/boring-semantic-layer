@@ -209,3 +209,92 @@ class TestReadOnlyAnnotations:
                 t = tools[name]
                 assert t.annotations.readOnlyHint is True, f"{name} should be readOnly"
                 assert t.annotations.destructiveHint is False, f"{name} should not be destructive"
+
+
+class TestConnectSourceCredentialScrub:
+    """Credentials must never appear in error messages."""
+
+    @pytest.fixture(scope="class")
+    def setup_table(self, con):
+        df = pd.DataFrame({"x": [1]})
+        con.create_table("scrub_t", df, overwrite=True)
+        return "scrub_t"
+
+    @pytest.mark.asyncio
+    async def test_password_scrubbed_from_connection_failure(
+        self, con, setup_table, tmp_path, monkeypatch
+    ):
+        """Force open_backend to raise with a credential-bearing message;
+        assert the ToolError doesn't leak the password."""
+
+        def fake_open(config):
+            raise Exception("auth failed for user pg_admin password=hunter2 token=secret_xyz")
+
+        # The tool imports open_backend lazily inside the registration; patch
+        # it on the source module so the deferred import sees the fake.
+        monkeypatch.setattr(
+            "boring_semantic_layer.agents.backends._source_inspection.open_backend",
+            fake_open,
+        )
+
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool(
+                    "connect_source",
+                    {
+                        "backend": "postgres",
+                        "profile_name": "scrub_test",
+                        "connection_params": {
+                            "host": "x",
+                            "password": "hunter2",
+                            "token": "secret_xyz",
+                        },
+                    },
+                )
+            msg = str(exc_info.value)
+            assert "hunter2" not in msg
+            assert "secret_xyz" not in msg
+
+
+class TestConnectSourceTruncation:
+    """When >100 tables exist, the response truncates and reports it."""
+
+    @pytest.fixture(scope="class")
+    def setup_table(self, con):
+        df = pd.DataFrame({"x": [1]})
+        con.create_table("trunc_t", df, overwrite=True)
+        return "trunc_t"
+
+    @pytest.mark.asyncio
+    async def test_truncates_at_100(self, con, setup_table, tmp_path, monkeypatch):
+        """Patch list_tables_with_counts to return more than 100 rows."""
+        from boring_semantic_layer.agents.backends._source_inspection import TableSummary
+
+        def fake_list(con, *, limit_tables=100):
+            n = limit_tables  # 100
+            summaries = [
+                TableSummary(name=f"t{i}", row_count=i, count_error=None) for i in range(n)
+            ]
+            return summaries, True  # truncated
+
+        monkeypatch.setattr(
+            "boring_semantic_layer.agents.backends._source_inspection.list_tables_with_counts",
+            fake_list,
+        )
+
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "connect_source",
+                {
+                    "backend": "duckdb",
+                    "profile_name": "trunc_test",
+                    "connection_params": {"database": ":memory:"},
+                },
+            )
+            data = json.loads(result.content[0].text) if result.content else result.data
+            assert data["truncated"] is True
+            assert len(data["available_tables"]) == 100
