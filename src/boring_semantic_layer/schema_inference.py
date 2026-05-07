@@ -369,3 +369,51 @@ def render_yaml(proposed: ProposedSchema, profile: str | None = None) -> str:
                 lines.append(f"      description: {_yaml_scalar(m.description)}")
 
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Top-level orchestrator
+# ---------------------------------------------------------------------------
+
+
+def infer_schema(
+    table_name: str,
+    ibis_table,
+    existing_models: Mapping[str, SemanticModel],
+    *,
+    description: str | None = None,
+    profile: str | None = None,
+) -> ProposedSchema:
+    """Top-level orchestrator: schema → classifications → joins → YAML.
+
+    Args:
+        table_name: Name to use for the new model in the YAML.
+        ibis_table: An ibis table expression (already bound to a backend).
+        existing_models: Mapping of existing semantic models, used for
+            join-target detection. Pass ``{}`` for greenfield.
+        description: Optional model-level description; defaults to humanized name.
+        profile: Currently unused — accepted for API symmetry.
+    """
+    schema = ibis_table.schema()
+    columns = [classify_column(name, dtype) for name, dtype in schema.items()]
+
+    joins = find_potential_joins(columns, existing_models)
+    final_description = description if description else _humanize(table_name)
+
+    proposed = ProposedSchema(
+        table_name=table_name,
+        description=final_description,
+        columns=columns,
+        potential_joins=joins,
+        proposed_yaml="",
+    )
+
+    rendered = render_yaml(proposed, profile=profile)
+    # Replace the empty proposed_yaml — frozen dataclass requires re-construction
+    return ProposedSchema(
+        table_name=proposed.table_name,
+        description=proposed.description,
+        columns=proposed.columns,
+        potential_joins=proposed.potential_joins,
+        proposed_yaml=rendered,
+    )

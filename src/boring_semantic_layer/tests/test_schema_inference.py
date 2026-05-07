@@ -10,7 +10,9 @@ from dataclasses import FrozenInstanceError
 from io import StringIO
 from unittest.mock import MagicMock
 
+import ibis
 import ibis.expr.datatypes as dt
+import pandas as pd
 import pytest
 import yaml as _pyyaml
 
@@ -19,6 +21,7 @@ from boring_semantic_layer.schema_inference import (
     PotentialJoin,
     ProposedSchema,
     find_potential_joins,
+    infer_schema,
     render_yaml,
 )
 
@@ -320,3 +323,65 @@ class TestRenderYaml:
             assert "expr" in dim_cfg
         for meas_cfg in flights["measures"].values():
             assert "expr" in meas_cfg
+
+
+@pytest.fixture(scope="module")
+def duckdb_con():
+    return ibis.duckdb.connect(":memory:")
+
+
+@pytest.fixture(scope="module")
+def flights_table(duckdb_con):
+    df = pd.DataFrame(
+        {
+            "carrier_id": [1, 2, 3],
+            "origin": ["JFK", "LAX", "ORD"],
+            "flight_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]).date,
+            "dep_delay": [5.0, 10.0, 0.0],
+        }
+    )
+    duckdb_con.create_table("infer_flights", df, overwrite=True)
+    return duckdb_con.table("infer_flights")
+
+
+class TestInferSchema:
+    def test_infer_returns_proposed_schema(self, flights_table):
+        result = infer_schema("flights", flights_table, existing_models={})
+        assert isinstance(result, ProposedSchema)
+        assert result.table_name == "flights"
+
+    def test_columns_classified_correctly(self, flights_table):
+        result = infer_schema("flights", flights_table, existing_models={})
+        by_name = {c.column: c for c in result.columns}
+        assert by_name["carrier_id"].classification == "dimension"
+        assert by_name["origin"].classification == "dimension"
+        assert by_name["flight_date"].is_time_dimension is True
+        assert by_name["dep_delay"].classification == "measure"
+
+    def test_potential_join_surfaced_when_target_exists(self, flights_table):
+        existing = {"carriers": _fake_model("carriers", ["id", "name"])}
+        result = infer_schema("flights", flights_table, existing_models=existing)
+        assert len(result.potential_joins) == 1
+        assert result.potential_joins[0].matches_model == "carriers"
+
+    def test_no_joins_when_registry_empty(self, flights_table):
+        result = infer_schema("flights", flights_table, existing_models={})
+        assert result.potential_joins == []
+
+    def test_proposed_yaml_is_loadable(self, flights_table):
+        result = infer_schema("flights", flights_table, existing_models={})
+        parsed = _pyyaml.safe_load(StringIO(result.proposed_yaml))
+        assert "flights" in parsed
+        assert "dimensions" in parsed["flights"]
+        assert "measures" in parsed["flights"]
+
+    def test_description_falls_back_to_humanized_name(self, flights_table):
+        result = infer_schema("flights", flights_table, existing_models={})
+        # Default description: humanized table name
+        assert "Flights" in result.description or "flights" in result.description.lower()
+
+    def test_explicit_description_used(self, flights_table):
+        result = infer_schema(
+            "flights", flights_table, existing_models={}, description="Flight records 2024"
+        )
+        assert result.description == "Flight records 2024"
