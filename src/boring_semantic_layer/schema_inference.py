@@ -12,8 +12,12 @@ field so an agent can review and override before persisting the YAML.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from .expr import SemanticModel
 
 
 @dataclass(frozen=True)
@@ -221,3 +225,89 @@ def classify_column(name: str, ibis_dtype) -> ColumnClassification:
         description=description,
         reasoning=f"unknown dtype '{dtype_str}' → fallback dimension",
     )
+
+
+# ---------------------------------------------------------------------------
+# Join inference heuristics
+# ---------------------------------------------------------------------------
+
+_FK_SUFFIX = re.compile(r"^(?P<prefix>.+?)_(id|key|code)$", re.IGNORECASE)
+
+
+def _strip_fk_suffix(name: str) -> str | None:
+    """Return the prefix for an FK-shaped name (``carrier_id`` → ``carrier``), else None."""
+    m = _FK_SUFFIX.match(name)
+    return m.group("prefix") if m else None
+
+
+def _pick_join_dimension(model_dim_names: list[str], target_model: str) -> str | None:
+    """Walk the priority list and return the first matching dim name.
+
+    Order: ``id`` > ``<target_model>_id`` > ``code`` > first dim.
+    """
+    if "id" in model_dim_names:
+        return "id"
+    candidate = f"{target_model}_id"
+    if candidate in model_dim_names:
+        return candidate
+    if "code" in model_dim_names:
+        return "code"
+    if model_dim_names:
+        return model_dim_names[0]
+    return None
+
+
+def find_potential_joins(
+    columns: list[ColumnClassification],
+    existing_models: Mapping[str, SemanticModel],
+) -> list[PotentialJoin]:
+    """Surface likely joins between FK-shaped columns and existing models.
+
+    For each new-schema column ending in ``_id``/``_key``/``_code``:
+      1. Strip the suffix to get a prefix (``carrier_id`` → ``carrier``).
+      2. Match the prefix against existing model names in singular/plural form.
+      3. Pick a target dim by priority (id > <model>_id > code > first dim).
+      4. Default ``suggested_type="one"`` (FK→PK is the common case).
+    """
+    if not existing_models:
+        return []
+
+    joins: list[PotentialJoin] = []
+    for col in columns:
+        prefix = _strip_fk_suffix(col.column)
+        if prefix is None:
+            continue
+
+        # Match singular and plural forms
+        candidates = {prefix.lower(), f"{prefix.lower()}s"}
+        matched_model: str | None = None
+        for model_name in existing_models:
+            if model_name.lower() in candidates:
+                matched_model = model_name
+                break
+        if matched_model is None:
+            continue
+
+        target = existing_models[matched_model]
+        try:
+            dim_names = list(target.get_dimensions().keys())
+        except Exception:
+            dim_names = []
+        target_dim = _pick_join_dimension(dim_names, matched_model)
+        if target_dim is None:
+            continue
+
+        joins.append(
+            PotentialJoin(
+                column=col.column,
+                matches_model=matched_model,
+                matches_dimension=target_dim,
+                suggested_type="one",
+                reasoning=(
+                    f"FK prefix '{prefix}' matched model '{matched_model}'; "
+                    f"picked dim '{target_dim}'"
+                ),
+            )
+        )
+
+    return joins
