@@ -7,16 +7,19 @@ find_potential_joins, render_yaml, and the infer_schema orchestrator.
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from io import StringIO
 from unittest.mock import MagicMock
 
 import ibis.expr.datatypes as dt
 import pytest
+import yaml as _pyyaml
 
 from boring_semantic_layer.schema_inference import (
     ColumnClassification,
     PotentialJoin,
     ProposedSchema,
     find_potential_joins,
+    render_yaml,
 )
 
 
@@ -201,3 +204,119 @@ class TestFindPotentialJoins:
         ]
         existing = {"revenues": _fake_model("revenues", ["id"])}
         assert find_potential_joins(cols, existing) == []
+
+
+class TestRenderYaml:
+    """Spec section 4.1: render_yaml emits ONLY the new model block (no profile: header)."""
+
+    def _proposed(self, **overrides):
+        defaults = dict(
+            table_name="flights",
+            description="Flight data",
+            columns=[
+                ColumnClassification(
+                    column="origin",
+                    dtype="string",
+                    classification="dimension",
+                    aggregation=None,
+                    is_time_dimension=False,
+                    smallest_time_grain=None,
+                    description="Origin",
+                    reasoning="string",
+                ),
+                ColumnClassification(
+                    column="flight_date",
+                    dtype="date",
+                    classification="dimension",
+                    aggregation=None,
+                    is_time_dimension=True,
+                    smallest_time_grain="TIME_GRAIN_DAY",
+                    description="Flight Date",
+                    reasoning="date",
+                ),
+                ColumnClassification(
+                    column="flight_count",
+                    dtype="int64",
+                    classification="measure",
+                    aggregation="sum",
+                    is_time_dimension=False,
+                    smallest_time_grain=None,
+                    description="Flight Count",
+                    reasoning="sum suffix",
+                ),
+            ],
+            potential_joins=[],
+            proposed_yaml="",  # filled by render
+        )
+        defaults.update(overrides)
+        return ProposedSchema(**defaults)
+
+    def test_no_profile_header_emitted(self):
+        rendered = render_yaml(self._proposed(), profile=None)
+        # Top-level keys must not include `profile:` — output is appendable
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        assert "profile" not in parsed
+        assert "flights" in parsed
+
+    def test_emits_table_field(self):
+        rendered = render_yaml(self._proposed(), profile=None)
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        assert parsed["flights"]["table"] == "flights"
+
+    def test_dimensions_emitted_with_extended_form(self):
+        rendered = render_yaml(self._proposed(), profile=None)
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        dims = parsed["flights"]["dimensions"]
+        assert dims["origin"]["expr"] == "_.origin"
+        assert dims["origin"]["description"] == "Origin"
+
+    def test_time_dimension_flags_set(self):
+        rendered = render_yaml(self._proposed(), profile=None)
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        fd = parsed["flights"]["dimensions"]["flight_date"]
+        assert fd["is_time_dimension"] is True
+        assert fd["smallest_time_grain"] == "TIME_GRAIN_DAY"
+
+    def test_measures_emit_aggregation_expr(self):
+        rendered = render_yaml(self._proposed(), profile=None)
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        m = parsed["flights"]["measures"]
+        assert m["flight_count"]["expr"] == "_.flight_count.sum()"
+        assert m["flight_count"]["description"] == "Flight Count"
+
+    def test_count_measure_uses_count_aggregation(self):
+        cols = [
+            ColumnClassification(
+                column="row_count",
+                dtype="int64",
+                classification="measure",
+                aggregation="count",
+                is_time_dimension=False,
+                smallest_time_grain=None,
+                description="Row Count",
+                reasoning="",
+            )
+        ]
+        rendered = render_yaml(self._proposed(columns=cols), profile=None)
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        # count is special-cased — no column reference
+        assert parsed["flights"]["measures"]["row_count"]["expr"] == "_.count()"
+
+    def test_description_emitted_at_model_level(self):
+        rendered = render_yaml(self._proposed(), profile=None)
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        assert parsed["flights"]["description"] == "Flight data"
+
+    def test_round_trip_through_from_yaml_shape(self):
+        """Sanity check — emitted YAML parses to a dict matching from_yaml's input shape."""
+        rendered = render_yaml(self._proposed(), profile=None)
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        flights = parsed["flights"]
+        assert isinstance(flights, dict)
+        assert "dimensions" in flights
+        assert "measures" in flights
+        # Every dimension dict has an `expr` field
+        for dim_cfg in flights["dimensions"].values():
+            assert "expr" in dim_cfg
+        for meas_cfg in flights["measures"].values():
+            assert "expr" in meas_cfg

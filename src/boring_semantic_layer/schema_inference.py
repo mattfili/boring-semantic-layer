@@ -311,3 +311,61 @@ def find_potential_joins(
         )
 
     return joins
+
+
+# ---------------------------------------------------------------------------
+# YAML rendering
+# ---------------------------------------------------------------------------
+
+
+def _yaml_scalar(s: str) -> str:
+    """Quote a string for safe single-line YAML emission. Always double-quote."""
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _measure_expr(col: ColumnClassification) -> str:
+    """Build the BSL ``_`` expression for a measure given its aggregation."""
+    if col.aggregation == "count":
+        return "_.count()"
+    return f"_.{col.column}.{col.aggregation}()"
+
+
+def render_yaml(proposed: ProposedSchema, profile: str | None = None) -> str:
+    """Render ONLY the new model block as YAML — no ``profile:`` header.
+
+    The ``profile`` arg is accepted for API symmetry but currently unused;
+    the caller appends to a YAML file that already has its own ``profile:``.
+    Returns a string ending in a newline so it appends cleanly.
+    """
+    lines: list[str] = []
+    lines.append(f"{proposed.table_name}:")
+    if proposed.description:
+        lines.append(f"  description: {_yaml_scalar(proposed.description)}")
+    lines.append(f"  table: {proposed.table_name}")
+
+    # Dimensions — always extended form (`expr:` + `description:`)
+    dims = [c for c in proposed.columns if c.classification == "dimension"]
+    if dims:
+        lines.append("  dimensions:")
+        for d in dims:
+            lines.append(f"    {d.column}:")
+            lines.append(f"      expr: _.{d.column}")
+            if d.description:
+                lines.append(f"      description: {_yaml_scalar(d.description)}")
+            if d.is_time_dimension:
+                lines.append("      is_time_dimension: true")
+                if d.smallest_time_grain:
+                    lines.append(f"      smallest_time_grain: {d.smallest_time_grain}")
+
+    # Measures
+    measures = [c for c in proposed.columns if c.classification == "measure"]
+    if measures:
+        lines.append("  measures:")
+        for m in measures:
+            lines.append(f"    {m.column}:")
+            lines.append(f"      expr: {_measure_expr(m)}")
+            if m.description:
+                lines.append(f"      description: {_yaml_scalar(m.description)}")
+
+    return "\n".join(lines) + "\n"
