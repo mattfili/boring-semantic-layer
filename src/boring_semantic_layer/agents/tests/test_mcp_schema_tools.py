@@ -7,6 +7,7 @@ test class to avoid clobbering across the shared connection.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import ibis
@@ -84,3 +85,57 @@ class TestSchemaToolsRegistration:
             assert "infer_schema" in tool_names
             assert "get_domain_context" not in tool_names
             assert "add_skill" not in tool_names
+
+
+class TestListBackends:
+    """list_backends — synchronous, no DB calls."""
+
+    @pytest.fixture(scope="class")
+    def setup_table(self, con):
+        df = pd.DataFrame({"x": [1]})
+        con.create_table("list_backends_t", df, overwrite=True)
+        return "list_backends_t"
+
+    @pytest.mark.asyncio
+    async def test_returns_installed_and_available_lists(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            result = await client.call_tool("list_backends", {})
+            data = json.loads(result.content[0].text) if result.content else result.data
+            assert "installed_backends" in data
+            assert "available_backends" in data
+            assert "install_instructions" in data
+            # duckdb is a hard dep — must be installed
+            assert "duckdb" in data["installed_backends"]
+
+    @pytest.mark.asyncio
+    async def test_install_instructions_keys_match_supported(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            result = await client.call_tool("list_backends", {})
+            data = json.loads(result.content[0].text) if result.content else result.data
+            expected = {
+                "duckdb",
+                "postgres",
+                "snowflake",
+                "bigquery",
+                "mysql",
+                "sqlite",
+                "clickhouse",
+            }
+            assert set(data["install_instructions"].keys()) == expected
+            for hint in data["install_instructions"].values():
+                assert "pip install" in hint
+                assert "ibis-framework[" in hint
+
+    @pytest.mark.asyncio
+    async def test_tool_annotations_readonly(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            tools = {t.name: t for t in await client.list_tools()}
+            t = tools["list_backends"]
+            assert t.annotations.readOnlyHint is True
+            assert t.annotations.destructiveHint is False
