@@ -11,6 +11,7 @@ field so an agent can review and override before persisting the YAML.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -71,3 +72,152 @@ class ProposedSchema:
     columns: list[ColumnClassification]
     potential_joins: list[PotentialJoin]
     proposed_yaml: str
+
+
+# ---------------------------------------------------------------------------
+# Column classification heuristics
+# ---------------------------------------------------------------------------
+
+# Identifier-shaped column names — these stay dimensions even when numeric
+_ID_PATTERN = re.compile(r"^id$|.*_id$|.*_key$|.*_code$", re.IGNORECASE)
+# Sum-shaped suffixes
+_SUM_PATTERN = re.compile(r".*(_count|_total|_amount|_sum)$", re.IGNORECASE)
+# Mean-shaped suffixes
+_MEAN_PATTERN = re.compile(r".*(_rate|_pct|_percent|_ratio|_avg|_mean)$", re.IGNORECASE)
+
+
+def _humanize(name: str) -> str:
+    """Convert snake_case to Title Case with common abbreviation fixups."""
+    abbreviations = {"id": "ID", "url": "URL", "uri": "URI", "ein": "EIN", "ssn": "SSN"}
+    parts = name.split("_")
+    out = []
+    for p in parts:
+        lower = p.lower()
+        if lower in abbreviations:
+            out.append(abbreviations[lower])
+        else:
+            out.append(p.capitalize())
+    return " ".join(out)
+
+
+def classify_column(name: str, ibis_dtype) -> ColumnClassification:
+    """Classify one column. Never raises — ambiguity goes into ``reasoning``.
+
+    Heuristic order (first match wins):
+      1. Bool → dimension
+      2. String → dimension
+      3. Date → time dimension (DAY grain)
+      4. Timestamp → time dimension (SECOND grain)
+      5. Numeric + ID-shape name → dimension (identifier)
+      6. Numeric + sum-shape name → measure (sum)
+      7. Numeric + mean-shape name → measure (mean)
+      8. Numeric default → measure (sum)
+      9. Anything else → dimension (conservative fallback)
+    """
+    dtype_str = str(ibis_dtype)
+    description = _humanize(name)
+
+    if ibis_dtype.is_boolean():
+        return ColumnClassification(
+            column=name,
+            dtype=dtype_str,
+            classification="dimension",
+            aggregation=None,
+            is_time_dimension=False,
+            smallest_time_grain=None,
+            description=description,
+            reasoning="bool dtype → dimension",
+        )
+
+    if ibis_dtype.is_string():
+        return ColumnClassification(
+            column=name,
+            dtype=dtype_str,
+            classification="dimension",
+            aggregation=None,
+            is_time_dimension=False,
+            smallest_time_grain=None,
+            description=description,
+            reasoning="string dtype → dimension",
+        )
+
+    if ibis_dtype.is_date():
+        return ColumnClassification(
+            column=name,
+            dtype=dtype_str,
+            classification="dimension",
+            aggregation=None,
+            is_time_dimension=True,
+            smallest_time_grain="TIME_GRAIN_DAY",
+            description=description,
+            reasoning="date dtype → time dimension at DAY grain",
+        )
+
+    if ibis_dtype.is_timestamp():
+        return ColumnClassification(
+            column=name,
+            dtype=dtype_str,
+            classification="dimension",
+            aggregation=None,
+            is_time_dimension=True,
+            smallest_time_grain="TIME_GRAIN_SECOND",
+            description=description,
+            reasoning="timestamp dtype → time dimension at SECOND grain",
+        )
+
+    if ibis_dtype.is_numeric():
+        if _ID_PATTERN.match(name):
+            return ColumnClassification(
+                column=name,
+                dtype=dtype_str,
+                classification="dimension",
+                aggregation=None,
+                is_time_dimension=False,
+                smallest_time_grain=None,
+                description=description,
+                reasoning="numeric + id/key/code suffix → identifier dimension",
+            )
+        if _SUM_PATTERN.match(name):
+            return ColumnClassification(
+                column=name,
+                dtype=dtype_str,
+                classification="measure",
+                aggregation="sum",
+                is_time_dimension=False,
+                smallest_time_grain=None,
+                description=description,
+                reasoning="numeric + count/total/amount/sum suffix → sum measure",
+            )
+        if _MEAN_PATTERN.match(name):
+            return ColumnClassification(
+                column=name,
+                dtype=dtype_str,
+                classification="measure",
+                aggregation="mean",
+                is_time_dimension=False,
+                smallest_time_grain=None,
+                description=description,
+                reasoning="numeric + rate/pct/ratio/avg/mean suffix → mean measure",
+            )
+        return ColumnClassification(
+            column=name,
+            dtype=dtype_str,
+            classification="measure",
+            aggregation="sum",
+            is_time_dimension=False,
+            smallest_time_grain=None,
+            description=description,
+            reasoning="numeric default → sum measure",
+        )
+
+    # Conservative fallback — unknown dtype → dimension
+    return ColumnClassification(
+        column=name,
+        dtype=dtype_str,
+        classification="dimension",
+        aggregation=None,
+        is_time_dimension=False,
+        smallest_time_grain=None,
+        description=description,
+        reasoning=f"unknown dtype '{dtype_str}' → fallback dimension",
+    )
