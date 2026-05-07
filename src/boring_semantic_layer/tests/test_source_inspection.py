@@ -83,6 +83,27 @@ class TestListTablesWithCounts:
         assert by_name["definitely_does_not_exist"].row_count is None
         assert by_name["definitely_does_not_exist"].count_error is not None
 
+    def test_per_table_timeout_recorded(self, monkeypatch):
+        """Slow COUNT(*) query times out and shows up with count_error."""
+        import time
+
+        from boring_semantic_layer.agents.backends import _source_inspection
+
+        con = open_backend({"type": "duckdb", "database": ":memory:"})
+        con.create_table("slow_t", pd.DataFrame({"x": [1]}))
+
+        # Patch _count_table to sleep longer than the timeout
+        def slow_count(con, name):
+            time.sleep(2)
+            return 0
+
+        monkeypatch.setattr(_source_inspection, "_count_table", slow_count)
+
+        results, _ = list_tables_with_counts(con, timeout_seconds=0.1)
+        by_name = {t.name: t for t in results}
+        assert by_name["slow_t"].row_count is None
+        assert "timed out" in by_name["slow_t"].count_error.lower()
+
     def test_table_summary_is_frozen_dataclass(self):
         t = TableSummary(name="foo", row_count=10, count_error=None)
         with pytest.raises(FrozenInstanceError):

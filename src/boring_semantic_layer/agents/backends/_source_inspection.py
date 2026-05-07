@@ -17,6 +17,7 @@ tools that touch live backends:
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import os
 import re
@@ -75,30 +76,47 @@ def list_tables_with_counts(
     con: BaseBackend,
     *,
     limit_tables: int = 100,
+    timeout_seconds: float = 5.0,
 ) -> tuple[list[TableSummary], bool]:
     """Enumerate tables with ``COUNT(*)`` per table.
 
-    Returns ``(summaries, truncated)``. A table whose count fails appears
-    with ``row_count=None`` and ``count_error`` set to the exception string;
-    the call itself never raises.
+    Returns ``(summaries, truncated)``. A table whose count fails or times
+    out appears with ``row_count=None`` and ``count_error`` set; the call
+    itself never raises.
 
     Args:
         con: Open ibis backend.
         limit_tables: Cap on number of tables; if more exist, the first
             ``limit_tables`` are returned and ``truncated`` is True.
+        timeout_seconds: Per-table timeout for COUNT(*). Tables that exceed
+            this show up with ``count_error="timed out after Xs"``.
     """
     all_names = list(con.list_tables())
     truncated = len(all_names) > limit_tables
     names = all_names[:limit_tables]
 
     summaries: list[TableSummary] = []
-    for name in names:
-        try:
-            count = int(con.table(name).count().execute())
-            summaries.append(TableSummary(name=name, row_count=count, count_error=None))
-        except Exception as exc:
-            summaries.append(TableSummary(name=name, row_count=None, count_error=str(exc)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        for name in names:
+            try:
+                future = executor.submit(_count_table, con, name)
+                count = future.result(timeout=timeout_seconds)
+                summaries.append(TableSummary(name=name, row_count=count, count_error=None))
+            except concurrent.futures.TimeoutError:
+                summaries.append(
+                    TableSummary(
+                        name=name,
+                        row_count=None,
+                        count_error=f"timed out after {timeout_seconds}s",
+                    )
+                )
+            except Exception as exc:
+                summaries.append(TableSummary(name=name, row_count=None, count_error=str(exc)))
     return summaries, truncated
+
+
+def _count_table(con: BaseBackend, name: str) -> int:
+    return int(con.table(name).count().execute())
 
 
 def build_profile_yaml(profile_name: str, backend: str, params: dict) -> str:

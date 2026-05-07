@@ -6,6 +6,7 @@ import importlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from fastmcp import Context
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
@@ -51,7 +52,9 @@ def _register_list_backends(server: MCPSemanticModel, prompts_dir: Path) -> None
         tags={"discovery"},
         annotations=_READONLY_ANNOTATIONS,
     )
-    def list_backends() -> dict:
+    async def list_backends(ctx: Context | None = None) -> dict:
+        if ctx:
+            await ctx.info("Enumerating supported ibis backends")
         installed: list[str] = []
         available: list[str] = []
         for backend in SUPPORTED_BACKENDS:
@@ -77,10 +80,11 @@ def _register_connect_source(server: MCPSemanticModel, prompts_dir: Path) -> Non
         tags={"metadata"},
         annotations=_READONLY_ANNOTATIONS,
     )
-    def connect_source(
+    async def connect_source(
         backend: str,
         profile_name: str,
         connection_params: dict,
+        ctx: Context | None = None,
     ) -> dict:
         # Imports inside function body so monkeypatch on the module path takes effect
         from ._source_inspection import (
@@ -105,10 +109,18 @@ def _register_connect_source(server: MCPSemanticModel, prompts_dir: Path) -> Non
         con = None
         warning = None
         try:
+            if ctx:
+                await ctx.info(f"Connecting to {backend} backend...")
+                await ctx.report_progress(progress=10, total=100)
+
             try:
                 con = open_backend(config)
             except Exception as exc:
                 raise ToolError(_sanitize_error(str(exc), connection_params)) from exc
+
+            if ctx:
+                await ctx.info("Connected. Listing tables (cap=100)...")
+                await ctx.report_progress(progress=50, total=100)
 
             try:
                 summaries, truncated = list_tables_with_counts(con, limit_tables=100)
@@ -127,6 +139,9 @@ def _register_connect_source(server: MCPSemanticModel, prompts_dir: Path) -> Non
                 warning = _sanitize_error(str(exc), connection_params)
 
             proposed_yaml = build_profile_yaml(profile_name, backend, connection_params)
+
+            if ctx:
+                await ctx.report_progress(progress=100, total=100)
 
             return {
                 "status": "connected",
@@ -196,12 +211,13 @@ def _register_infer_schema(server: MCPSemanticModel, prompts_dir: Path) -> None:
         tags={"discovery", "metadata"},
         annotations=_READONLY_ANNOTATIONS,
     )
-    def infer_schema(
+    async def infer_schema(
         table_name: str,
         source: str,
         source_type: str | None = None,
         description: str | None = None,
         profile: str | None = None,
+        ctx: Context | None = None,
     ) -> dict:
         # Resolve effective source_type
         if source_type is None:
@@ -213,6 +229,10 @@ def _register_infer_schema(server: MCPSemanticModel, prompts_dir: Path) -> None:
                 f"Model name '{table_name}' already registered. "
                 f"Existing models: {list(server.models.keys())}"
             )
+
+        if ctx:
+            await ctx.info(f"Inferring schema for '{table_name}' from {source_type} source")
+            await ctx.report_progress(progress=10, total=100)
 
         transient_con = None
         try:
@@ -228,6 +248,9 @@ def _register_infer_schema(server: MCPSemanticModel, prompts_dir: Path) -> None:
             if not ibis_tbl.schema():
                 raise ToolError(f"Source '{source}' has no columns")
 
+            if ctx:
+                await ctx.report_progress(progress=50, total=100)
+
             proposed = _infer(
                 table_name=table_name,
                 ibis_table=ibis_tbl,
@@ -235,6 +258,10 @@ def _register_infer_schema(server: MCPSemanticModel, prompts_dir: Path) -> None:
                 description=description,
                 profile=profile,
             )
+
+            if ctx:
+                await ctx.report_progress(progress=100, total=100)
+
             return _proposed_to_dict(proposed)
         finally:
             if transient_con is not None:
