@@ -8,13 +8,11 @@ no FastMCP dependency — it can be used standalone.
 All heuristics are best-effort. Every classification surfaces a ``reasoning``
 field so an agent can review and override before persisting the YAML.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
-
-if TYPE_CHECKING:
-    from .expr import SemanticModel
+from typing import Literal
 
 
 @dataclass(frozen=True)

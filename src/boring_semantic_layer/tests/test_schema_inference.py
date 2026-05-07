@@ -3,7 +3,12 @@
 No MCP, no live backend — covers the dataclasses, classify_column,
 find_potential_joins, render_yaml, and the infer_schema orchestrator.
 """
+
 from __future__ import annotations
+
+from dataclasses import FrozenInstanceError
+
+import pytest
 
 from boring_semantic_layer.schema_inference import (
     ColumnClassification,
@@ -26,9 +31,7 @@ class TestDataclasses:
         )
         assert c.column == "origin"
         # Frozen — assignment must raise
-        import pytest
-
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             c.column = "other"
 
     def test_potential_join_fields(self):
