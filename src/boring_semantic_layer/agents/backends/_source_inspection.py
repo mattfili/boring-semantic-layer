@@ -18,6 +18,7 @@ tools that touch live backends:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 import ibis
 from ibis import BaseBackend
@@ -57,3 +58,40 @@ def open_backend(profile_config: dict) -> BaseBackend:
         raise ValueError(f"Unknown backend type: '{conn_type}'")
     expanded = {k: os.path.expandvars(v) if isinstance(v, str) else v for k, v in config.items()}
     return connect_fn.connect(**expanded)
+
+
+@dataclass(frozen=True)
+class TableSummary:
+    name: str
+    row_count: int | None
+    count_error: str | None
+
+
+def list_tables_with_counts(
+    con: BaseBackend,
+    *,
+    limit_tables: int = 100,
+) -> tuple[list[TableSummary], bool]:
+    """Enumerate tables with ``COUNT(*)`` per table.
+
+    Returns ``(summaries, truncated)``. A table whose count fails appears
+    with ``row_count=None`` and ``count_error`` set to the exception string;
+    the call itself never raises.
+
+    Args:
+        con: Open ibis backend.
+        limit_tables: Cap on number of tables; if more exist, the first
+            ``limit_tables`` are returned and ``truncated`` is True.
+    """
+    all_names = list(con.list_tables())
+    truncated = len(all_names) > limit_tables
+    names = all_names[:limit_tables]
+
+    summaries: list[TableSummary] = []
+    for name in names:
+        try:
+            count = int(con.table(name).count().execute())
+            summaries.append(TableSummary(name=name, row_count=count, count_error=None))
+        except Exception as exc:
+            summaries.append(TableSummary(name=name, row_count=None, count_error=str(exc)))
+    return summaries, truncated
