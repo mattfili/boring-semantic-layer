@@ -5,14 +5,19 @@ build_profile_yaml, open_transient_duckdb_for_file, _sanitize_error.
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from io import StringIO
 
 import pandas as pd
 import pytest
+import yaml as _pyyaml
 
 from boring_semantic_layer.agents.backends._source_inspection import (
     TableSummary,
+    _sanitize_error,
+    build_profile_yaml,
     list_tables_with_counts,
     open_backend,
+    open_transient_duckdb_for_file,
 )
 
 
@@ -82,3 +87,89 @@ class TestListTablesWithCounts:
         t = TableSummary(name="foo", row_count=10, count_error=None)
         with pytest.raises(FrozenInstanceError):
             t.name = "bar"
+
+
+class TestBuildProfileYaml:
+    def test_basic_profile_round_trips(self):
+        rendered = build_profile_yaml(
+            "warehouse",
+            backend="postgres",
+            params={"host": "db.example.com", "port": 5432, "database": "prod"},
+        )
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        assert "warehouse" in parsed
+        assert parsed["warehouse"]["type"] == "postgres"
+        assert parsed["warehouse"]["host"] == "db.example.com"
+        assert parsed["warehouse"]["port"] == 5432
+
+    def test_env_var_literals_preserved(self):
+        rendered = build_profile_yaml(
+            "warehouse",
+            backend="postgres",
+            params={"host": "${PG_HOST}", "password": "${PG_PASSWORD}"},
+        )
+        # The literal `${PG_HOST}` must round-trip — no expansion at render time
+        assert "${PG_HOST}" in rendered
+        assert "${PG_PASSWORD}" in rendered
+        parsed = _pyyaml.safe_load(StringIO(rendered))
+        assert parsed["warehouse"]["host"] == "${PG_HOST}"
+
+
+class TestOpenTransientDuckdbForFile:
+    def test_parquet_path_loads_table(self, tmp_path):
+        df = pd.DataFrame({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+        parquet_path = tmp_path / "sample.parquet"
+        df.to_parquet(parquet_path)
+
+        con, tbl = open_transient_duckdb_for_file(str(parquet_path), "parquet")
+        try:
+            assert tbl.count().execute() == 3
+            schema = tbl.schema()
+            assert "x" in schema
+            assert "y" in schema
+        finally:
+            if hasattr(con, "disconnect"):
+                con.disconnect()
+
+    def test_csv_path_loads_table(self, tmp_path):
+        csv_path = tmp_path / "sample.csv"
+        csv_path.write_text("x,y\n1,a\n2,b\n")
+        con, tbl = open_transient_duckdb_for_file(str(csv_path), "csv")
+        try:
+            assert tbl.count().execute() == 2
+        finally:
+            if hasattr(con, "disconnect"):
+                con.disconnect()
+
+    def test_unsupported_format_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="Unsupported"):
+            open_transient_duckdb_for_file(str(tmp_path / "x.xlsx"), "xlsx")  # type: ignore
+
+
+class TestSanitizeError:
+    def test_scrubs_password_pattern(self):
+        msg = "auth failed for user pg_admin password=hunter2"
+        out = _sanitize_error(msg, params={})
+        assert "hunter2" not in out
+        assert "password=" not in out
+
+    def test_scrubs_url_credentials(self):
+        msg = "connection failed: postgres://admin:secret123@db.example.com/prod"
+        out = _sanitize_error(msg, params={})
+        assert "secret123" not in out
+        assert "admin:secret123" not in out
+
+    def test_scrubs_param_values(self):
+        msg = "bad credentials for token abcd-1234-xyz"
+        out = _sanitize_error(msg, params={"token": "abcd-1234-xyz"})
+        assert "abcd-1234-xyz" not in out
+
+    def test_preserves_non_credential_message(self):
+        msg = "host db.example.com unreachable"
+        out = _sanitize_error(msg, params={})
+        assert "db.example.com unreachable" in out
+
+    def test_scrubs_bearer_tokens(self):
+        msg = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.token.sig"
+        out = _sanitize_error(msg, params={})
+        assert "eyJhbGc" not in out

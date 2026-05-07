@@ -17,8 +17,12 @@ tools that touch live backends:
 
 from __future__ import annotations
 
+import contextlib
 import os
+import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
 
 import ibis
 from ibis import BaseBackend
@@ -95,3 +99,96 @@ def list_tables_with_counts(
         except Exception as exc:
             summaries.append(TableSummary(name=name, row_count=None, count_error=str(exc)))
     return summaries, truncated
+
+
+def build_profile_yaml(profile_name: str, backend: str, params: dict) -> str:
+    """Render a BSL profile YAML block. Preserves ``${VAR}`` literals.
+
+    Output shape (matches BSL's existing profile loader):
+
+    ```yaml
+    profile_name:
+      type: <backend>
+      <param>: <value>
+      ...
+    ```
+    """
+    lines = [f"{profile_name}:"]
+    lines.append(f"  type: {backend}")
+    for key, value in params.items():
+        lines.append(f"  {key}: {_yaml_value(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def _yaml_value(v) -> str:
+    """Render a YAML scalar preserving ${VAR} literals (not expanded)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v)
+    if "${" in s or any(ch in s for ch in ":#'\"\\"):
+        # Quote anything that could confuse YAML; escape backslash and double-quote
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return s
+
+
+def open_transient_duckdb_for_file(
+    path: str,
+    source_type: Literal["csv", "parquet", "json"],
+) -> tuple[BaseBackend, ibis.Table]:
+    """Open an in-memory DuckDB and read ``path`` as table ``_inferred``.
+
+    The caller is responsible for closing the connection (typically in a
+    ``try/finally``). The table name ``_inferred`` is fixed to keep the
+    inference contract simple.
+
+    Raises:
+        ValueError: If ``source_type`` isn't one of csv/parquet/json or the
+            path can't be read.
+    """
+    if source_type not in {"csv", "parquet", "json"}:
+        raise ValueError(f"Unsupported source_type '{source_type}'. Supported: csv, parquet, json")
+    if not Path(path).exists():
+        raise ValueError(f"File not found: {path}")
+
+    con = ibis.duckdb.connect(":memory:")
+    try:
+        if source_type == "parquet":
+            tbl = con.read_parquet(path, table_name="_inferred")
+        elif source_type == "csv":
+            tbl = con.read_csv(path, table_name="_inferred")
+        else:  # json
+            tbl = con.read_json(path, table_name="_inferred")
+        return con, tbl
+    except Exception:
+        # Best-effort cleanup if read fails
+        with contextlib.suppress(Exception):
+            con.disconnect()
+        raise
+
+
+_PASSWORD_PATTERN = re.compile(r"(password|secret|token|api_key|api-key)=\S+", re.IGNORECASE)
+_BEARER_PATTERN = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
+_URL_CREDS_PATTERN = re.compile(r"(\w+)://([^:/\s]+):([^@/\s]+)@")
+
+
+def _sanitize_error(msg: str, params: dict | None = None) -> str:
+    """Scrub credentials from an error message before surfacing to MCP clients.
+
+    Strips:
+      - Any value present verbatim in ``params``.
+      - ``password=...``, ``secret=...``, ``token=...``, ``api_key=...`` patterns.
+      - ``Bearer <token>`` patterns.
+      - URL-shaped credentials (``proto://user:pass@host`` → ``proto://***@host``).
+    """
+    out = str(msg)
+    if params:
+        for value in params.values():
+            if isinstance(value, str) and value:
+                out = out.replace(value, "***")
+    out = _PASSWORD_PATTERN.sub("***", out)
+    out = _BEARER_PATTERN.sub("Bearer ***", out)
+    out = _URL_CREDS_PATTERN.sub(r"\1://***@", out)
+    return out
