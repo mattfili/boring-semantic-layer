@@ -444,3 +444,84 @@ class TestInferSchemaFile:
             )
             data = json.loads(result.content[0].text) if result.content else result.data
             assert "orders_explicit:" in data["proposed_yaml"]
+
+
+class TestInferSchemaErrors:
+    """All error paths from spec section 6.1."""
+
+    @pytest.fixture(scope="class")
+    def setup_table(self, con):
+        df = pd.DataFrame({"x": [1]})
+        con.create_table("infer_err_t", df, overwrite=True)
+        return "infer_err_t"
+
+    @pytest.mark.asyncio
+    async def test_missing_table_raises(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool(
+                    "infer_schema",
+                    {
+                        "table_name": "x",
+                        "source": "definitely_not_a_table",
+                        "source_type": "table",
+                    },
+                )
+            assert "not found" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_missing_file_raises(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool(
+                    "infer_schema",
+                    {
+                        "table_name": "x",
+                        "source": "/nonexistent/path/data.parquet",
+                    },
+                )
+            msg = str(exc_info.value).lower()
+            assert "not found" in msg or "does not exist" in msg
+
+    @pytest.mark.asyncio
+    async def test_unsupported_file_extension_raises(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            xlsx = tmp_path / "data.xlsx"
+            xlsx.write_bytes(b"")  # empty file
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool(
+                    "infer_schema",
+                    {
+                        "table_name": "x",
+                        "source": str(xlsx),
+                    },
+                )
+            # Ext inference defaults to "table" for unknown extensions; .xlsx
+            # falls back to looking it up as a table — should report not found
+            assert (
+                "not found" in str(exc_info.value).lower()
+                or "unsupported" in str(exc_info.value).lower()
+            )
+
+    @pytest.mark.asyncio
+    async def test_name_collision_with_existing_model(self, con, setup_table, tmp_path):
+        """`table_name` must not collide with an already-registered model."""
+        bundle = _basic_bundle(con, setup_table, tmp_path)  # registers "flights"
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool(
+                    "infer_schema",
+                    {
+                        "table_name": "flights",  # collides
+                        "source": setup_table,
+                        "source_type": "table",
+                    },
+                )
+            assert "already" in str(exc_info.value).lower()
