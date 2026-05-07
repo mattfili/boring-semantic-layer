@@ -18,6 +18,7 @@ from ...skills import SkillMetadata
 from ...yaml import SemanticModelBundle
 from ..utils.chart_handler import generate_chart_with_data
 from ..utils.prompts import load_prompt
+from ._schema_mcp import register_schema_tools
 from ._skill_mcp import (
     WRITE_ANNOTATIONS,
     build_domain_context,
@@ -169,6 +170,7 @@ class MCPSemanticModel(FastMCP):
         code_mode: bool = False,
         include_domain_context_tool: bool = True,
         include_add_skill_tool: bool = True,
+        include_schema_tools: bool = False,
         **kwargs,
     ):
         transforms = kwargs.pop("transforms", [])
@@ -212,6 +214,9 @@ class MCPSemanticModel(FastMCP):
                 self._register_domain_context_tool()
             if include_add_skill_tool:
                 self._register_add_skill_tool()
+
+        if include_schema_tools:
+            register_schema_tools(self, PROMPTS_DIR)
 
     def _register_tools(self):
         @self.tool(
