@@ -38,6 +38,7 @@ def register_schema_tools(server: MCPSemanticModel, prompts_dir: Path) -> None:
     """Register all three schema tools on ``server``."""
     _register_list_backends(server, prompts_dir)
     _register_connect_source(server, prompts_dir)
+    _register_infer_schema(server, prompts_dir)
 
 
 def _register_list_backends(server: MCPSemanticModel, prompts_dir: Path) -> None:
@@ -141,3 +142,136 @@ def _register_connect_source(server: MCPSemanticModel, prompts_dir: Path) -> Non
                         con.disconnect()
                 except Exception:
                     pass
+
+
+def _resolve_table_source(server: MCPSemanticModel, source: str):
+    """Return (ibis_table, transient_con). transient_con is None for table sources."""
+    if not server.models:
+        raise ToolError(
+            "Cannot resolve table source: server has no registered models. "
+            "Either configure at least one model first, or pass a file path."
+        )
+    sample_model = next(iter(server.models.values()))
+    try:
+        con = sample_model.table._find_backend()
+    except Exception as exc:
+        # Fallback: try .op().source chain
+        con = getattr(sample_model.table.op(), "source", None)
+        if con is None:
+            raise ToolError(
+                "Could not resolve the connection from the running models. "
+                "Pass a file path with source_type='parquet' / 'csv' / 'json' instead."
+            ) from exc
+    if source not in con.list_tables():
+        available = con.list_tables()[:10]
+        raise ToolError(
+            f"Table '{source}' not found in the connected backend. "
+            f"Available (first 10): {available}"
+        )
+    return con.table(source), None
+
+
+def _resolve_file_source(source: str, source_type: str):
+    """Open a transient DuckDB and read the file."""
+    from ._source_inspection import _sanitize_error, open_transient_duckdb_for_file
+
+    try:
+        con, tbl = open_transient_duckdb_for_file(source, source_type)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    except Exception as exc:
+        raise ToolError(_sanitize_error(str(exc), {})) from exc
+    return tbl, con
+
+
+def _register_infer_schema(server: MCPSemanticModel, prompts_dir: Path) -> None:
+    from ...schema_inference import infer_schema as _infer
+
+    @server.tool(
+        name="infer_schema",
+        description=(
+            load_prompt(prompts_dir, "tool-infer-schema-desc.md")
+            or "Infer a BSL semantic model from a raw source."
+        ),
+        tags={"discovery", "metadata"},
+        annotations=_READONLY_ANNOTATIONS,
+    )
+    def infer_schema(
+        table_name: str,
+        source: str,
+        source_type: str | None = None,
+        description: str | None = None,
+        profile: str | None = None,
+    ) -> dict:
+        # Resolve effective source_type
+        if source_type is None:
+            ext = Path(source).suffix.lower().lstrip(".")
+            source_type = ext if ext in {"parquet", "csv", "json"} else "table"
+
+        if table_name in server.models:
+            raise ToolError(
+                f"Model name '{table_name}' already registered. "
+                f"Existing models: {list(server.models.keys())}"
+            )
+
+        transient_con = None
+        try:
+            if source_type == "table":
+                ibis_tbl, _ = _resolve_table_source(server, source)
+            elif source_type in {"csv", "parquet", "json"}:
+                ibis_tbl, transient_con = _resolve_file_source(source, source_type)
+            else:
+                raise ToolError(
+                    f"Unsupported source_type '{source_type}'. Supported: table, csv, parquet, json"
+                )
+
+            if not ibis_tbl.schema():
+                raise ToolError(f"Source '{source}' has no columns")
+
+            proposed = _infer(
+                table_name=table_name,
+                ibis_table=ibis_tbl,
+                existing_models=server.models,
+                description=description,
+                profile=profile,
+            )
+            return _proposed_to_dict(proposed)
+        finally:
+            if transient_con is not None:
+                try:
+                    if hasattr(transient_con, "disconnect"):
+                        transient_con.disconnect()
+                except Exception:
+                    pass
+
+
+def _proposed_to_dict(proposed) -> dict:
+    """Serialize ProposedSchema into a JSON-friendly dict."""
+    return {
+        "table_name": proposed.table_name,
+        "description": proposed.description,
+        "proposed_yaml": proposed.proposed_yaml,
+        "column_classifications": [
+            {
+                "column": c.column,
+                "dtype": c.dtype,
+                "classification": c.classification,
+                "aggregation": c.aggregation,
+                "is_time_dimension": c.is_time_dimension,
+                "smallest_time_grain": c.smallest_time_grain,
+                "description": c.description,
+                "reasoning": c.reasoning,
+            }
+            for c in proposed.columns
+        ],
+        "potential_joins": [
+            {
+                "column": j.column,
+                "matches_model": j.matches_model,
+                "matches_dimension": j.matches_dimension,
+                "suggested_type": j.suggested_type,
+                "reasoning": j.reasoning,
+            }
+            for j in proposed.potential_joins
+        ],
+    }

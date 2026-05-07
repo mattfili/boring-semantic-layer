@@ -59,7 +59,6 @@ class TestSchemaToolsRegistration:
             assert "list_models" in tool_names
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason="connect_source + infer_schema land in tasks 12+14", strict=False)
     async def test_flag_enabled_registers_all_three(self, con, setup_table, tmp_path):
         bundle = _basic_bundle(con, setup_table, tmp_path)
         mcp = MCPSemanticModel(bundle, include_schema_tools=True)
@@ -70,7 +69,6 @@ class TestSchemaToolsRegistration:
             assert "list_backends" in tool_names
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason="full registration lands across tasks 11+12+14", strict=False)
     async def test_flag_independent_of_skill_flags(self, con, setup_table, tmp_path):
         """Schema tools have no dependency on skills_dir."""
         bundle = _basic_bundle(con, setup_table, tmp_path)
@@ -199,7 +197,6 @@ class TestReadOnlyAnnotations:
         return "ro_annot_t"
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason="infer_schema lands in task 14", strict=False)
     async def test_all_tools_readonly(self, con, setup_table, tmp_path):
         bundle = _basic_bundle(con, setup_table, tmp_path)
         mcp = MCPSemanticModel(bundle, include_schema_tools=True)
@@ -298,3 +295,88 @@ class TestConnectSourceTruncation:
             data = json.loads(result.content[0].text) if result.content else result.data
             assert data["truncated"] is True
             assert len(data["available_tables"]) == 100
+
+
+class TestInferSchemaTable:
+    """infer_schema against an existing table in the profile's connection."""
+
+    @pytest.fixture(scope="class")
+    def setup_table(self, con):
+        df = pd.DataFrame(
+            {
+                "carrier_id": [1, 2, 3],
+                "origin": ["JFK", "LAX", "ORD"],
+                "flight_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]).date,
+                "dep_delay": [5.0, 10.0, 0.0],
+            }
+        )
+        con.create_table("infer_table_t", df, overwrite=True)
+        return "infer_table_t"
+
+    @pytest.mark.asyncio
+    async def test_returns_proposed_yaml_and_classifications(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "infer_schema",
+                {
+                    "table_name": "new_flights",
+                    "source": setup_table,
+                    "source_type": "table",
+                },
+            )
+            data = json.loads(result.content[0].text) if result.content else result.data
+            assert "new_flights:" in data["proposed_yaml"]
+            classifications = {c["column"]: c for c in data["column_classifications"]}
+            assert classifications["carrier_id"]["classification"] == "dimension"
+            assert classifications["dep_delay"]["classification"] == "measure"
+            assert classifications["flight_date"]["is_time_dimension"] is True
+
+
+class TestInferSchemaJoins:
+    """When a registry model matches the FK prefix, surface a potential join."""
+
+    @pytest.fixture(scope="class")
+    def setup_tables(self, con):
+        flights_df = pd.DataFrame({"carrier_id": [1, 2], "origin": ["A", "B"]})
+        carriers_df = pd.DataFrame({"id": [1, 2], "name": ["AA", "UA"]})
+        con.create_table("join_flights_t", flights_df, overwrite=True)
+        con.create_table("join_carriers_t", carriers_df, overwrite=True)
+        return ("join_flights_t", "join_carriers_t")
+
+    @pytest.mark.asyncio
+    async def test_potential_join_to_registered_carriers(self, con, setup_tables, tmp_path):
+        flights_table, carriers_table = setup_tables
+        yaml_path = tmp_path / "cfg.yml"
+        _write_yaml(
+            yaml_path,
+            f"""
+carriers:
+  table: {carriers_table}
+  dimensions:
+    id: _.id
+    name: _.name
+  measures:
+    carrier_count: _.count()
+""",
+        )
+        bundle = from_yaml(
+            str(yaml_path),
+            tables={carriers_table: con.table(carriers_table)},
+        )
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "infer_schema",
+                {
+                    "table_name": "flights",
+                    "source": flights_table,
+                    "source_type": "table",
+                },
+            )
+            data = json.loads(result.content[0].text) if result.content else result.data
+            joins = data["potential_joins"]
+            assert len(joins) == 1
+            assert joins[0]["matches_model"] == "carriers"
+            assert joins[0]["matches_dimension"] == "id"
