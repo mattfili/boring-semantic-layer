@@ -139,3 +139,73 @@ class TestListBackends:
             t = tools["list_backends"]
             assert t.annotations.readOnlyHint is True
             assert t.annotations.destructiveHint is False
+
+
+class TestConnectSourceLocal:
+    """connect_source against an in-memory DuckDB."""
+
+    @pytest.fixture(scope="class")
+    def setup_table(self, con):
+        df = pd.DataFrame({"x": [1]})
+        con.create_table("conn_local_t", df, overwrite=True)
+        return "conn_local_t"
+
+    @pytest.mark.asyncio
+    async def test_connects_to_duckdb_memory(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "connect_source",
+                {
+                    "backend": "duckdb",
+                    "profile_name": "test_local",
+                    "connection_params": {"database": ":memory:"},
+                },
+            )
+            data = json.loads(result.content[0].text) if result.content else result.data
+            assert data["status"] == "connected"
+            assert "test_local:" in data["proposed_profile_yaml"]
+            assert "type: duckdb" in data["proposed_profile_yaml"]
+            assert isinstance(data["available_tables"], list)
+
+    @pytest.mark.asyncio
+    async def test_unsupported_backend_raises_tool_error(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool(
+                    "connect_source",
+                    {
+                        "backend": "definitely-not-supported",
+                        "profile_name": "x",
+                        "connection_params": {},
+                    },
+                )
+            assert (
+                "not supported" in str(exc_info.value).lower()
+                or "supported" in str(exc_info.value).lower()
+            )
+
+
+class TestReadOnlyAnnotations:
+    """All three tools must declare read-only annotations."""
+
+    @pytest.fixture(scope="class")
+    def setup_table(self, con):
+        df = pd.DataFrame({"x": [1]})
+        con.create_table("ro_annot_t", df, overwrite=True)
+        return "ro_annot_t"
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(reason="infer_schema lands in task 14", strict=False)
+    async def test_all_tools_readonly(self, con, setup_table, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            tools = {t.name: t for t in await client.list_tools()}
+            for name in ("infer_schema", "connect_source", "list_backends"):
+                t = tools[name]
+                assert t.annotations.readOnlyHint is True, f"{name} should be readOnly"
+                assert t.annotations.destructiveHint is False, f"{name} should not be destructive"
