@@ -380,3 +380,67 @@ carriers:
             assert len(joins) == 1
             assert joins[0]["matches_model"] == "carriers"
             assert joins[0]["matches_dimension"] == "id"
+
+
+class TestInferSchemaFile:
+    """infer_schema against the inferable.parquet fixture (file-source path)."""
+
+    @pytest.fixture(scope="class")
+    def setup_table(self, con):
+        df = pd.DataFrame({"x": [1]})
+        con.create_table("infer_file_baseline", df, overwrite=True)
+        return "infer_file_baseline"
+
+    @pytest.fixture(scope="class")
+    def parquet_path(self) -> Path:
+        path = (
+            Path(__file__).parent.parent.parent
+            / "tests"
+            / "fixtures"
+            / "sample_tables"
+            / "inferable.parquet"
+        )
+        assert path.exists(), f"fixture missing: {path}"
+        return path
+
+    @pytest.mark.asyncio
+    async def test_infers_from_parquet_extension(self, con, setup_table, parquet_path, tmp_path):
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "infer_schema",
+                {
+                    "table_name": "orders_from_file",
+                    "source": str(parquet_path),
+                    # No explicit source_type → inferred from .parquet extension
+                },
+            )
+            data = json.loads(result.content[0].text) if result.content else result.data
+            assert "orders_from_file:" in data["proposed_yaml"]
+            cls = {c["column"]: c for c in data["column_classifications"]}
+            assert cls["order_id"]["classification"] == "dimension"
+            assert cls["customer_id"]["classification"] == "dimension"
+            assert cls["order_total"]["classification"] == "measure"
+            assert cls["order_date"]["is_time_dimension"] is True
+            assert cls["is_paid"]["classification"] == "dimension"
+
+    @pytest.mark.asyncio
+    async def test_explicit_source_type_overrides_extension(
+        self, con, setup_table, parquet_path, tmp_path
+    ):
+        """Explicit source_type beats extension inference."""
+        bundle = _basic_bundle(con, setup_table, tmp_path)
+        mcp = MCPSemanticModel(bundle, include_schema_tools=True)
+        async with Client(mcp) as client:
+            # Pass source_type="parquet" explicitly — should still work
+            result = await client.call_tool(
+                "infer_schema",
+                {
+                    "table_name": "orders_explicit",
+                    "source": str(parquet_path),
+                    "source_type": "parquet",
+                },
+            )
+            data = json.loads(result.content[0].text) if result.content else result.data
+            assert "orders_explicit:" in data["proposed_yaml"]
