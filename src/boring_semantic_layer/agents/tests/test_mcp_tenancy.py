@@ -7,6 +7,7 @@ via httpx.ASGITransport. This module starts with constructor validation.
 
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import httpx
 import ibis
@@ -20,7 +21,7 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 from boring_semantic_layer import to_semantic_table
 from boring_semantic_layer.agents.backends._tenancy import TenancyConfig
-from boring_semantic_layer.agents.backends.mcp import MCPSemanticModel
+from boring_semantic_layer.agents.backends.mcp import MCPSemanticModel, _client_supports_elicitation
 
 VERIFIER_TOKENS = {
     "token-alpha": {"client_id": "tenant-alpha", "scopes": ["bsl:read"], "schema": "tenant_alpha"},
@@ -243,3 +244,25 @@ class TestStdioRefusal:
         """Default transport (None → STDIO) must raise RuntimeError."""
         with pytest.raises(RuntimeError, match="cannot run over STDIO"):
             await tenant_mcp.run_async()
+
+
+class TestClientSupportsElicitation:
+    def test_true_when_capability_advertised(self):
+        ctx = SimpleNamespace(
+            session=SimpleNamespace(
+                client_params=SimpleNamespace(capabilities=SimpleNamespace(elicitation=object()))
+            )
+        )
+        assert _client_supports_elicitation(ctx) is True
+
+    def test_false_when_capability_absent(self):
+        ctx = SimpleNamespace(
+            session=SimpleNamespace(
+                client_params=SimpleNamespace(capabilities=SimpleNamespace(elicitation=None))
+            )
+        )
+        assert _client_supports_elicitation(ctx) is False
+
+    def test_false_when_client_params_missing(self):
+        ctx = SimpleNamespace(session=SimpleNamespace(client_params=None))
+        assert _client_supports_elicitation(ctx) is False

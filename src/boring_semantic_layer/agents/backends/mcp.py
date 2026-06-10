@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import sys
 from collections.abc import Callable, Mapping
@@ -31,6 +32,8 @@ from ._skill_mcp import (
 from ._tenancy import TenancyConfig, TenantModelCache, resolve_tenant_schema
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 _find_time_dimension = find_time_dimension  # backwards-compat alias
 
@@ -142,6 +145,33 @@ def _client_supports_elicitation(ctx: Context) -> bool:
     return bool(params and getattr(params.capabilities, "elicitation", None))
 
 
+def _validate_tenancy_contract(models, tenancy, auth) -> bool:
+    """Validate the tenant-mode constructor contract; return is_factory.
+
+    Tenant mode requires a per-schema factory (a static mapping would serve
+    one tenant's data to all tenants) and a verifier (unverified claims
+    cannot scope anything).
+    """
+    is_factory = callable(models) and not isinstance(models, Mapping)
+    if tenancy is not None:
+        if not is_factory:
+            raise ValueError(
+                "Multi-tenant mode requires `models` to be a callable "
+                "(schema: str) -> Mapping[str, SemanticTable]."
+            )
+        if auth is None:
+            raise ValueError(
+                "Multi-tenant mode requires an auth provider (`auth=`); "
+                "without token verification, tenant claims cannot be trusted."
+            )
+    elif is_factory:
+        raise ValueError(
+            "`models` was passed as a callable but `tenancy` is not set; "
+            "pass tenancy=TenancyConfig(...) or a static mapping."
+        )
+    return is_factory
+
+
 async def resolve_model(
     models: Mapping[str, Any],
     model_name: str,
@@ -172,7 +202,8 @@ async def resolve_model(
                     await ctx.info(f"Resolved to model '{picked}'")
                     return models[picked]
         except Exception:
-            pass  # Belt-and-braces: elicitation failed — fall through
+            logger.debug("elicitation fallback: client elicit failed", exc_info=True)
+            # Belt-and-braces: elicitation failed — fall through
 
     raise ToolError(f"Model '{model_name}' not found. Available models: {list(models.keys())}")
 
@@ -194,39 +225,16 @@ class MCPSemanticModel(FastMCP):
     ):
         """Initialise the MCP semantic-layer server.
 
-        Parameters
-        ----------
-        models:
-            Either a static ``Mapping[str, SemanticTable]``, a
-            ``SemanticModelBundle`` (from ``from_yaml``), or — in tenant mode —
-            a callable ``(schema: str) -> Mapping[str, SemanticTable]`` that
-            builds the model set for one tenant's schema.
-        tenancy:
-            When provided, enables schema-per-tenant mode.  ``models`` must be
-            a factory callable and ``auth`` must also be supplied.
-        **kwargs:
-            Forwarded to ``FastMCP.__init__`` (e.g. ``auth=``, ``port=``).
+        Args:
+            models: Either a static ``Mapping[str, SemanticTable]``, a
+                ``SemanticModelBundle`` (from ``from_yaml``), or — in tenant mode —
+                a callable ``(schema: str) -> Mapping[str, SemanticTable]`` that
+                builds the model set for one tenant's schema.
+            tenancy: When provided, enables schema-per-tenant mode. ``models`` must be
+                a factory callable and ``auth`` must also be supplied.
+            **kwargs: Forwarded to ``FastMCP.__init__`` (e.g. ``auth=``, ``port=``).
         """
-        # Tenant mode contract: models must be a per-schema factory (a static
-        # mapping would serve one tenant's data to all tenants), and a verifier
-        # must be present (unverified claims cannot scope anything).
-        is_factory = callable(models) and not isinstance(models, Mapping)
-        if tenancy is not None:
-            if not is_factory:
-                raise ValueError(
-                    "Multi-tenant mode requires `models` to be a callable "
-                    "(schema: str) -> Mapping[str, SemanticTable]."
-                )
-            if kwargs.get("auth") is None:
-                raise ValueError(
-                    "Multi-tenant mode requires an auth provider (`auth=`); "
-                    "without token verification, tenant claims cannot be trusted."
-                )
-        elif is_factory:
-            raise ValueError(
-                "`models` was passed as a callable but `tenancy` is not set; "
-                "pass tenancy=TenancyConfig(...) or a static mapping."
-            )
+        _validate_tenancy_contract(models, tenancy, kwargs.get("auth"))
 
         transforms = kwargs.pop("transforms", [])
         if code_mode:
@@ -307,6 +315,17 @@ class MCPSemanticModel(FastMCP):
         **transport_kwargs,
     ) -> None:
         """Run the server, refusing STDIO in tenant mode.
+
+        Args:
+            transport: Transport type — ``Transport | None`` (one of ``'stdio'``,
+                ``'http'``, ``'sse'``, ``'streamable-http'``, or ``None`` which
+                defaults to ``'stdio'``). Multi-tenant servers reject ``stdio``
+                and ``None`` because access tokens are unavailable over that
+                transport.
+            show_banner: Whether to print the startup banner. Forwarded to
+                ``FastMCP.run_async``.
+            **transport_kwargs: Additional keyword arguments forwarded to the
+                underlying transport.
 
         Tokens only exist on HTTP transports; over STDIO get_access_token()
         is None and every tenant check would fail at first tool call — fail
@@ -513,6 +532,10 @@ class MCPSemanticModel(FastMCP):
             if ctx:
                 await ctx.report_progress(progress=90, total=100)
 
+                # Session state is tenant-scoped by session identity: a session
+                # is bound to one client connection and hence one token. If a
+                # proxy ever reuses sessions across token rotations, store the
+                # tenant schema alongside and compare on read.
                 # Store query in session state for follow-up tools
                 await ctx.set_state(
                     "last_query",
@@ -579,7 +602,8 @@ class MCPSemanticModel(FastMCP):
                                 resolved = True
                                 await ctx.info(f"Resolved to dimension '{picked}'")
                     except Exception:
-                        pass  # Client doesn't support elicitation
+                        logger.debug("elicitation fallback: client elicit failed", exc_info=True)
+                        # Client doesn't support elicitation
 
                 if not resolved:
                     raise ToolError(
@@ -813,6 +837,10 @@ class MCPSemanticModel(FastMCP):
             parent_dirs: list[Path] = (
                 [self._parent_skills_dir] if self._parent_skills_dir is not None else []
             )
+            # Reads static self.models: safe because tenant mode zeroes all
+            # skills attrs in __init__, so this tool is never registered there.
+            # If skills ever land in tenant mode, route through
+            # _models_for_request() instead.
             return build_domain_context(parent_dirs, self._model_skills_dirs, self.models)
 
     def _register_add_skill_tool(self):
