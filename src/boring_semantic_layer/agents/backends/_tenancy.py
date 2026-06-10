@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+import threading
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,3 +69,35 @@ def resolve_tenant_schema(token: Any, config: TenancyConfig) -> str:
     if config.allowed_schemas is not None and schema not in config.allowed_schemas:
         raise ToolError("Tenant schema is not among the allowed schemas for this server.")
     return schema
+
+
+class TenantModelCache:
+    """LRU cache of per-tenant model mappings, keyed by schema name.
+
+    The lock guards the OrderedDict only; the factory runs outside it (a slow
+    factory must not block other tenants — a rare duplicate build is fine).
+    """
+
+    def __init__(self, maxsize: int = 32):
+        self._maxsize = maxsize
+        self._cache: OrderedDict[str, Mapping[str, Any]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(
+        self,
+        schema: str,
+        factory: Callable[[str], Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        """Return cached models for ``schema``, building via ``factory`` on miss."""
+        with self._lock:
+            if schema in self._cache:
+                self._cache.move_to_end(schema)
+                return self._cache[schema]
+        models = factory(schema)
+        with self._lock:
+            self._cache[schema] = models
+            self._cache.move_to_end(schema)
+            while len(self._cache) > self._maxsize:
+                evicted, _ = self._cache.popitem(last=False)
+                logger.info("tenancy: evicted cached models for schema %s", evicted)
+        return models

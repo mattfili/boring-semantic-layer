@@ -5,6 +5,7 @@ from fastmcp.exceptions import ToolError
 
 from boring_semantic_layer.agents.backends._tenancy import (
     TenancyConfig,
+    TenantModelCache,
     resolve_tenant_schema,
 )
 
@@ -60,3 +61,37 @@ class TestResolveTenantSchema:
         config = TenancyConfig(allowed_schemas=frozenset({"tenant_a"}))
         token = FakeToken({"schema": "tenant_a"})
         assert resolve_tenant_schema(token, config) == "tenant_a"
+
+
+class TestTenantModelCache:
+    def test_factory_called_once_per_schema(self):
+        calls = []
+
+        def factory(schema):
+            calls.append(schema)
+            return {"m": schema}
+
+        cache = TenantModelCache(maxsize=4)
+        assert cache.get("tenant_a", factory) == {"m": "tenant_a"}
+        assert cache.get("tenant_a", factory) == {"m": "tenant_a"}
+        assert calls == ["tenant_a"]
+
+    def test_distinct_schemas_get_distinct_models(self):
+        cache = TenantModelCache(maxsize=4)
+        a = cache.get("tenant_a", lambda s: {"m": s})
+        b = cache.get("tenant_b", lambda s: {"m": s})
+        assert a != b
+
+    def test_lru_eviction_beyond_maxsize(self):
+        calls = []
+
+        def factory(schema):
+            calls.append(schema)
+            return {"m": schema}
+
+        cache = TenantModelCache(maxsize=2)
+        cache.get("t1", factory)
+        cache.get("t2", factory)
+        cache.get("t3", factory)  # evicts t1
+        cache.get("t1", factory)  # rebuild
+        assert calls == ["t1", "t2", "t3", "t1"]
