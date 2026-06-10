@@ -1,7 +1,7 @@
 import json
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -27,6 +27,7 @@ from ._skill_mcp import (
     validate_skill_name,
     write_skill,
 )
+from ._tenancy import TenancyConfig, TenantModelCache
 
 load_dotenv()
 
@@ -163,29 +164,77 @@ _resolve_model = resolve_model  # backwards-compat alias
 class MCPSemanticModel(FastMCP):
     def __init__(
         self,
-        models: Mapping[str, Any] | SemanticModelBundle,
+        models: Mapping[str, Any] | SemanticModelBundle | Callable[[str], Mapping[str, Any]],
         name: str = "Semantic Layer MCP Server",
         instructions: str = SYSTEM_INSTRUCTIONS,
         code_mode: bool = False,
         include_domain_context_tool: bool = True,
         include_add_skill_tool: bool = True,
+        tenancy: TenancyConfig | None = None,
         **kwargs,
     ):
+        """Initialise the MCP semantic-layer server.
+
+        Parameters
+        ----------
+        models:
+            Either a static ``Mapping[str, SemanticTable]``, a
+            ``SemanticModelBundle`` (from ``from_yaml``), or — in tenant mode —
+            a callable ``(schema: str) -> Mapping[str, SemanticTable]`` that
+            builds the model set for one tenant's schema.
+        tenancy:
+            When provided, enables schema-per-tenant mode.  ``models`` must be
+            a factory callable and ``auth`` must also be supplied.
+        **kwargs:
+            Forwarded to ``FastMCP.__init__`` (e.g. ``auth=``, ``port=``).
+        """
+        # Tenant mode contract: models must be a per-schema factory (a static
+        # mapping would serve one tenant's data to all tenants), and a verifier
+        # must be present (unverified claims cannot scope anything).
+        is_factory = callable(models) and not isinstance(models, Mapping)
+        if tenancy is not None:
+            if not is_factory:
+                raise ValueError(
+                    "Multi-tenant mode requires `models` to be a callable "
+                    "(schema: str) -> Mapping[str, SemanticTable]."
+                )
+            if kwargs.get("auth") is None:
+                raise ValueError(
+                    "Multi-tenant mode requires an auth provider (`auth=`); "
+                    "without token verification, tenant claims cannot be trusted."
+                )
+        elif is_factory:
+            raise ValueError(
+                "`models` was passed as a callable but `tenancy` is not set; "
+                "pass tenancy=TenancyConfig(...) or a static mapping."
+            )
+
         transforms = kwargs.pop("transforms", [])
         if code_mode:
             transforms = [*transforms, *_build_code_mode_transforms()]
         super().__init__(name=name, instructions=instructions, transforms=transforms, **kwargs)
 
-        # Extract skills metadata if a bundle was passed; otherwise treat as
-        # a plain mapping for backward compatibility.
-        if isinstance(models, SemanticModelBundle):
+        self._tenancy = tenancy
+        if tenancy is not None:
+            # Tenant mode: every read goes through the per-request resolver
+            # (Task 5).  No static models; bundle skills are not supported.
+            self._model_factory: Callable[[str], Mapping[str, Any]] = models  # type: ignore[assignment]
+            self._tenant_models: TenantModelCache = TenantModelCache(
+                maxsize=tenancy.max_cached_tenants
+            )
+            self.models: Mapping[str, Any] = {}
+            self._parent_skills: list[SkillMetadata] = []
+            self._model_skills: dict[str, list[SkillMetadata]] = {}
+            self._parent_skills_dir: Path | None = None
+            self._model_skills_dirs: dict[str, Path] = {}
+        elif isinstance(models, SemanticModelBundle):
+            # Extract skills metadata if a bundle was passed; otherwise treat as
+            # a plain mapping for backward compatibility.
             self.models = models
-            self._parent_skills: list[SkillMetadata] = list(models.parent_skills)
-            self._model_skills: dict[str, list[SkillMetadata]] = {
-                k: list(v) for k, v in models.model_skills.items()
-            }
-            self._parent_skills_dir: Path | None = models.parent_skills_dir
-            self._model_skills_dirs: dict[str, Path] = dict(models.model_skills_dirs)
+            self._parent_skills = list(models.parent_skills)
+            self._model_skills = {k: list(v) for k, v in models.model_skills.items()}
+            self._parent_skills_dir = models.parent_skills_dir
+            self._model_skills_dirs = dict(models.model_skills_dirs)
         else:
             self.models = models
             self._parent_skills = []
