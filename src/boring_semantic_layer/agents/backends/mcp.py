@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
+import anyio
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_access_token
 from mcp.types import Annotations, ToolAnnotations
 from pydantic import Field
 from pydantic.functional_validators import BeforeValidator
@@ -27,11 +29,16 @@ from ._skill_mcp import (
     validate_skill_name,
     write_skill,
 )
-from ._tenancy import TenancyConfig, TenantModelCache
+from ._tenancy import TenancyConfig, TenantModelCache, resolve_tenant_schema
 
 load_dotenv()
 
 _find_time_dimension = find_time_dimension  # backwards-compat alias
+
+# Elicitation timeout: clients that don't support elicitation may hang
+# indefinitely rather than raising immediately. Bail out quickly so the tool
+# error path is reached without blocking the request.
+_ELICIT_TIMEOUT_S = 3.0
 
 
 def _get_prompts_dir() -> Path:
@@ -133,7 +140,12 @@ async def resolve_model(
     model_name: str,
     ctx: Context | None,
 ) -> Any:
-    """Resolve a model by name, using elicitation if available and model not found."""
+    """Resolve a model by name, using elicitation if available and model not found.
+
+    Elicitation is attempted with a short timeout (_ELICIT_TIMEOUT_S) so that
+    clients which do not support it (and hang instead of raising) degrade
+    quickly to the ToolError path rather than blocking the request indefinitely.
+    """
     if model_name in models:
         return models[model_name]
 
@@ -141,19 +153,20 @@ async def resolve_model(
     if ctx:
         available = list(models.keys())
         try:
-            response = await ctx.elicit(
-                f"Model '{model_name}' not found. "
-                f"Available models: {', '.join(available)}. "
-                f"Which model did you mean?",
-                response_type=ModelSelection,
-            )
+            with anyio.fail_after(_ELICIT_TIMEOUT_S):
+                response = await ctx.elicit(
+                    f"Model '{model_name}' not found. "
+                    f"Available models: {', '.join(available)}. "
+                    f"Which model did you mean?",
+                    response_type=ModelSelection,
+                )
             if response.action == "accept" and response.data:
                 picked = response.data.model_name
                 if picked in models:
                     await ctx.info(f"Resolved to model '{picked}'")
                     return models[picked]
         except Exception:
-            pass  # Client doesn't support elicitation — fall through to error
+            pass  # Client doesn't support elicitation, or timed out — fall through
 
     raise ToolError(f"Model '{model_name}' not found. Available models: {list(models.keys())}")
 
@@ -216,8 +229,8 @@ class MCPSemanticModel(FastMCP):
 
         self._tenancy = tenancy
         if tenancy is not None:
-            # Tenant mode: every read goes through the per-request resolver
-            # (Task 5).  No static models; bundle skills are not supported.
+            # Tenant mode: every read goes through the per-request resolver.
+            # No static models; bundle skills are not supported.
             self._model_factory: Callable[[str], Mapping[str, Any]] = models  # type: ignore[assignment]
             self._tenant_models: TenantModelCache = TenantModelCache(
                 maxsize=tenancy.max_cached_tenants
@@ -262,6 +275,47 @@ class MCPSemanticModel(FastMCP):
             if include_add_skill_tool:
                 self._register_add_skill_tool()
 
+    def _current_tenant_schema(self) -> str | None:
+        """Return the tenant schema for this request, or None on single-tenant servers."""
+        if self._tenancy is None:
+            return None
+        return resolve_tenant_schema(get_access_token(), self._tenancy)
+
+    def _models_for_request(self) -> Mapping[str, Any]:
+        """Return the model mapping for the current request.
+
+        Single-tenant: the static mapping. Multi-tenant: models built (or
+        cached) for the schema named by the request token's claims — the
+        request can never execute against any other schema because every
+        table reference is created from this mapping.
+        """
+        if self._tenancy is None:
+            return self.models
+        schema = resolve_tenant_schema(get_access_token(), self._tenancy)
+        return self._tenant_models.get(schema, self._model_factory)
+
+    async def run_async(
+        self,
+        transport=None,
+        show_banner: bool | None = None,
+        **transport_kwargs,
+    ) -> None:
+        """Run the server, refusing STDIO in tenant mode.
+
+        Tokens only exist on HTTP transports; over STDIO get_access_token()
+        is None and every tenant check would fail at first tool call — fail
+        loudly at startup instead.
+        """
+        if self._tenancy is not None and (transport is None or transport == "stdio"):
+            raise RuntimeError(
+                "Multi-tenant mode cannot run over STDIO: access tokens are "
+                "unavailable, so tenant isolation cannot be enforced. "
+                "Run with transport='http'."
+            )
+        return await super().run_async(
+            transport=transport, show_banner=show_banner, **transport_kwargs
+        )
+
     def _register_tools(self):
         @self.tool(
             name="list_models",
@@ -270,7 +324,8 @@ class MCPSemanticModel(FastMCP):
             annotations=READONLY_ANNOTATIONS,
         )
         def list_models() -> Mapping[str, str]:
-            return {name: f"Semantic model: {name}" for name in self.models}
+            """List all available semantic models for the current request's tenant."""
+            return {name: f"Semantic model: {name}" for name in self._models_for_request()}
 
         @self.tool(
             name="get_model",
@@ -282,7 +337,8 @@ class MCPSemanticModel(FastMCP):
             model_name: str,
             ctx: Context | None = None,
         ) -> Mapping[str, Any]:
-            model = await resolve_model(self.models, model_name, ctx)
+            """Return schema metadata for one semantic model."""
+            model = await resolve_model(self._models_for_request(), model_name, ctx)
             return _build_model_info(model)
 
         @self.tool(
@@ -295,7 +351,8 @@ class MCPSemanticModel(FastMCP):
             model_name: str,
             ctx: Context | None = None,
         ) -> Mapping[str, Any]:
-            model = await resolve_model(self.models, model_name, ctx)
+            """Return the time range for a model's time dimension."""
+            model = await resolve_model(self._models_for_request(), model_name, ctx)
             return _get_time_range_data(model, model_name)
 
         @self.tool(
@@ -414,7 +471,7 @@ class MCPSemanticModel(FastMCP):
             ] = None,
             ctx: Context | None = None,
         ) -> str:
-            model = await resolve_model(self.models, model_name, ctx)
+            model = await resolve_model(self._models_for_request(), model_name, ctx)
 
             if ctx:
                 await ctx.info(
@@ -483,7 +540,8 @@ class MCPSemanticModel(FastMCP):
             limit: int = 20,
             ctx: Context | None = None,
         ) -> dict:
-            model = await resolve_model(self.models, model_name, ctx)
+            """Search for dimension values within a model."""
+            model = await resolve_model(self._models_for_request(), model_name, ctx)
 
             if ctx:
                 await ctx.info(
@@ -672,9 +730,11 @@ class MCPSemanticModel(FastMCP):
             annotations=Annotations(audience=["assistant"], priority=1.0),
         )
         def list_models_resource() -> str:
+            """List all available models as a JSON object."""
+            models = self._models_for_request()
             models_list = {}
-            for model_name in self.models:
-                model = self.models[model_name]
+            for model_name in models:
+                model = models[model_name]
                 info = {"name": model_name}
                 if model.description:
                     info["description"] = model.description
@@ -689,10 +749,12 @@ class MCPSemanticModel(FastMCP):
             annotations=Annotations(audience=["assistant"], priority=0.8),
         )
         def get_model_resource(model_name: str) -> str:
-            if model_name not in self.models:
+            """Return schema metadata for a single model as JSON."""
+            models = self._models_for_request()
+            if model_name not in models:
                 raise ToolError(f"Model {model_name} not found")
 
-            return json.dumps(_build_model_info(self.models[model_name]), indent=2)
+            return json.dumps(_build_model_info(models[model_name]), indent=2)
 
         @self.resource(
             uri="semantic://models/{model_name}/time-range",
@@ -702,10 +764,12 @@ class MCPSemanticModel(FastMCP):
             annotations=Annotations(audience=["assistant"], priority=0.5),
         )
         def get_time_range_resource(model_name: str) -> str:
-            if model_name not in self.models:
+            """Return the time range bounds for a model's time dimension as JSON."""
+            models = self._models_for_request()
+            if model_name not in models:
                 raise ToolError(f"Model {model_name} not found")
 
-            model = self.models[model_name]
+            model = models[model_name]
             all_dims = list(model.dimensions)
             time_dim_name = find_time_dimension(model, all_dims)
 
