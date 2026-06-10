@@ -29,7 +29,7 @@ from ._skill_mcp import (
     validate_skill_name,
     write_skill,
 )
-from ._tenancy import TenancyConfig, TenantModelCache, resolve_tenant_schema
+from ._tenancy import TenancyConfig, TenantModelCache, emit_audit, resolve_tenant_schema
 
 load_dotenv()
 
@@ -554,6 +554,31 @@ class MCPSemanticModel(FastMCP):
 
                 await ctx.report_progress(progress=100, total=100)
 
+            if self._tenancy is not None:
+                # Rowcount comes from the serialized result's "records" list.
+                # None (not 0) when records were not requested or are unparsable
+                # — an unknown count must not masquerade as an empty result.
+                rowcount = None
+                try:
+                    records = json.loads(result).get("records")
+                    if isinstance(records, list):
+                        rowcount = len(records)
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                await emit_audit(
+                    self._tenancy,
+                    {
+                        "tenant_schema": self._current_tenant_schema(),
+                        "tool": "query_model",
+                        "model": model_name,
+                        "dimensions": dimensions,
+                        "measures": measures,
+                        "filters": filters,
+                        "limit": limit,
+                        "rowcount": rowcount,
+                    },
+                )
+
             return result
 
         @self.tool(
@@ -686,6 +711,21 @@ class MCPSemanticModel(FastMCP):
                     }
             else:
                 values, is_complete = _fetch(agg, limit)
+
+            if self._tenancy is not None:
+                # Error paths raise ToolError and never reach here — only the
+                # success path produces auditable data, so we audit once here.
+                await emit_audit(
+                    self._tenancy,
+                    {
+                        "tenant_schema": self._current_tenant_schema(),
+                        "tool": "search_dimension_values",
+                        "model": model_name,
+                        "dimension": dimension_name,
+                        "search_term": search_term,
+                        "rowcount": len(values),
+                    },
+                )
 
             return {
                 "total_distinct": total_distinct,

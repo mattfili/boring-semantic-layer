@@ -266,3 +266,58 @@ class TestClientSupportsElicitation:
     def test_false_when_client_params_missing(self):
         ctx = SimpleNamespace(session=SimpleNamespace(client_params=None))
         assert _client_supports_elicitation(ctx) is False
+
+
+class TestAudit:
+    """Per-tenant audit events are emitted by query tools when tenancy is configured."""
+
+    @pytest.mark.asyncio
+    async def test_query_model_emits_audit_event(self, tenant_con):
+        """query_model emits one audit event with tenant, tool, model, and rowcount."""
+        events = []
+        server = MCPSemanticModel(
+            models=make_factory(tenant_con),
+            tenancy=TenancyConfig(on_query=events.append),
+            auth=StaticTokenVerifier(tokens=VERIFIER_TOKENS),
+        )
+        async with tenant_client(server, "token-alpha") as client:
+            await client.call_tool("query_model", QUERY_ARGS)
+        assert len(events) == 1
+        event = events[0]
+        assert event["tenant_schema"] == "tenant_alpha"
+        assert event["tool"] == "query_model"
+        assert event["model"] == "flights"
+        assert event["rowcount"] == 1
+
+    @pytest.mark.asyncio
+    async def test_search_dimension_values_emits_audit_event(self, tenant_con):
+        """search_dimension_values emits one audit event with tenant, tool, dimension, rowcount."""
+        events = []
+        server = MCPSemanticModel(
+            models=make_factory(tenant_con),
+            tenancy=TenancyConfig(on_query=events.append),
+            auth=StaticTokenVerifier(tokens=VERIFIER_TOKENS),
+        )
+        async with tenant_client(server, "token-alpha") as client:
+            await client.call_tool(
+                "search_dimension_values",
+                {"model_name": "flights", "dimension_name": "carrier"},
+            )
+        assert len(events) == 1
+        event = events[0]
+        assert event["tenant_schema"] == "tenant_alpha"
+        assert event["tool"] == "search_dimension_values"
+        assert event["dimension"] == "carrier"
+        assert event["rowcount"] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_audit_events_in_single_tenant_mode(self, tenant_con):
+        """Single-tenant servers have no tenancy config — query_model must not error."""
+        # Build static models by calling the factory once (no auth needed)
+        models = make_factory(tenant_con)("tenant_alpha")
+        server = MCPSemanticModel(models=models)
+        async with Client(server) as client:
+            result = await client.call_tool("query_model", QUERY_ARGS)
+        records = records_from(result)
+        assert len(records) == 1
+        assert records[0]["carrier"] == "AA"
