@@ -1,0 +1,62 @@
+"""Unit tests for the tenancy module — pure logic, no MCP protocol."""
+
+import pytest
+from fastmcp.exceptions import ToolError
+
+from boring_semantic_layer.agents.backends._tenancy import (
+    TenancyConfig,
+    resolve_tenant_schema,
+)
+
+
+class FakeToken:
+    """Minimal stand-in for fastmcp AccessToken (only .claims is read)."""
+
+    def __init__(self, claims):
+        self.claims = claims
+
+
+class TestResolveTenantSchema:
+    def test_resolves_schema_from_default_claim(self):
+        config = TenancyConfig()
+        token = FakeToken({"schema": "tenant_a"})
+        assert resolve_tenant_schema(token, config) == "tenant_a"
+
+    def test_resolves_schema_from_custom_claim(self):
+        config = TenancyConfig(schema_claim="tenant")
+        token = FakeToken({"tenant": "tenant_b"})
+        assert resolve_tenant_schema(token, config) == "tenant_b"
+
+    def test_no_token_raises(self):
+        with pytest.raises(ToolError, match="authenticated HTTP transport"):
+            resolve_tenant_schema(None, TenancyConfig())
+
+    def test_missing_claim_raises(self):
+        token = FakeToken({"sub": "someone"})
+        with pytest.raises(ToolError, match="missing the 'schema' claim"):
+            resolve_tenant_schema(token, TenancyConfig())
+
+    def test_non_string_claim_raises(self):
+        token = FakeToken({"schema": 42})
+        with pytest.raises(ToolError, match="missing the 'schema' claim"):
+            resolve_tenant_schema(token, TenancyConfig())
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["tenant-a; DROP TABLE x", "a.b", 'a"b', "1tenant", "", "tenant a"],
+    )
+    def test_invalid_identifier_raises(self, bad):
+        token = FakeToken({"schema": bad})
+        with pytest.raises(ToolError, match="not a valid schema identifier|missing the"):
+            resolve_tenant_schema(token, TenancyConfig())
+
+    def test_allowlist_blocks_unknown_schema(self):
+        config = TenancyConfig(allowed_schemas=frozenset({"tenant_a"}))
+        token = FakeToken({"schema": "tenant_z"})
+        with pytest.raises(ToolError, match="not among the allowed schemas"):
+            resolve_tenant_schema(token, config)
+
+    def test_allowlist_permits_known_schema(self):
+        config = TenancyConfig(allowed_schemas=frozenset({"tenant_a"}))
+        token = FakeToken({"schema": "tenant_a"})
+        assert resolve_tenant_schema(token, config) == "tenant_a"
