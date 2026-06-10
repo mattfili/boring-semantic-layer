@@ -311,6 +311,29 @@ class TestAudit:
         assert event["rowcount"] == 1
 
     @pytest.mark.asyncio
+    async def test_search_fallback_path_also_audited(self, tenant_con):
+        events = []
+        server = MCPSemanticModel(
+            models=make_factory(tenant_con),
+            tenancy=TenancyConfig(on_query=events.append),
+            auth=StaticTokenVerifier(tokens=VERIFIER_TOKENS),
+        )
+        async with tenant_client(server, "token-alpha") as client:
+            result = await client.call_tool(
+                "search_dimension_values",
+                {
+                    "model_name": "flights",
+                    "dimension_name": "carrier",
+                    "search_term": "zzz-no-such-carrier",
+                },
+            )
+        payload = json.loads(result.content[0].text)
+        assert payload["values"] == []
+        assert payload["fallback_top_values"]  # real data returned...
+        assert len(events) == 1  # ...so it must be audited
+        assert events[0]["rowcount"] == 1
+
+    @pytest.mark.asyncio
     async def test_no_audit_events_in_single_tenant_mode(self, tenant_con):
         """Single-tenant servers have no tenancy config — query_model must not error."""
         # Build static models by calling the factory once (no auth needed)

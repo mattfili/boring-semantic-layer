@@ -682,6 +682,8 @@ class MCPSemanticModel(FastMCP):
             _SEP = r"[\s\-_.,]+"
 
             # Apply case-insensitive search filter if provided
+            fallback_values = None
+            note = None
             if search_term:
                 search_normalized = re.sub(_SEP, " ", search_term.lower()).strip()
                 filtered_agg = agg.filter(
@@ -698,23 +700,17 @@ class MCPSemanticModel(FastMCP):
 
                 # Fallback: if search returned nothing, show top values as reference
                 if not values:
-                    fallback_values, fallback_complete = _fetch(agg, limit)
-                    return {
-                        "total_distinct": total_distinct,
-                        "is_complete": fallback_complete,
-                        "values": [],
-                        "fallback_top_values": fallback_values,
-                        "note": (
-                            f"No matches found for '{search_term}'. "
-                            "Showing top values for reference — use one of these exact spellings."
-                        ),
-                    }
+                    fallback_values, is_complete = _fetch(agg, limit)
+                    note = (
+                        f"No matches found for '{search_term}'. "
+                        "Showing top values for reference — use one of these exact spellings."
+                    )
             else:
                 values, is_complete = _fetch(agg, limit)
 
             if self._tenancy is not None:
-                # Error paths raise ToolError and never reach here — only the
-                # success path produces auditable data, so we audit once here.
+                # Audit both shapes: matched values AND the no-match fallback —
+                # the fallback still returns real dimension values.
                 await emit_audit(
                     self._tenancy,
                     {
@@ -723,15 +719,19 @@ class MCPSemanticModel(FastMCP):
                         "model": model_name,
                         "dimension": dimension_name,
                         "search_term": search_term,
-                        "rowcount": len(values),
+                        "rowcount": len(fallback_values if fallback_values is not None else values),
                     },
                 )
 
-            return {
+            response = {
                 "total_distinct": total_distinct,
                 "is_complete": is_complete,
                 "values": values,
             }
+            if fallback_values is not None:
+                response["fallback_top_values"] = fallback_values
+                response["note"] = note
+            return response
 
         @self.tool(
             name="summarize_results",
