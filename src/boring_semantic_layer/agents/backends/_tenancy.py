@@ -7,6 +7,7 @@ server wiring so every rule here is unit-testable without the MCP protocol.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import threading
@@ -101,3 +102,19 @@ class TenantModelCache:
                 evicted, _ = self._cache.popitem(last=False)
                 logger.info("tenancy: evicted cached models for schema %s", evicted)
         return models
+
+
+async def emit_audit(config: TenancyConfig, event: dict[str, Any]) -> None:
+    """Deliver one audit event to the configured callback, if any.
+
+    Audit failures are logged, never raised — a broken sink must not take the
+    query path down. (Logged loudly so the drop is visible, not silent.)
+    """
+    if config.on_query is None:
+        return
+    try:
+        result = config.on_query(event)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.warning("tenancy: audit callback failed for event %r", event, exc_info=True)

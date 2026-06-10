@@ -6,6 +6,7 @@ from fastmcp.exceptions import ToolError
 from boring_semantic_layer.agents.backends._tenancy import (
     TenancyConfig,
     TenantModelCache,
+    emit_audit,
     resolve_tenant_schema,
 )
 
@@ -95,3 +96,37 @@ class TestTenantModelCache:
         cache.get("t3", factory)  # evicts t1
         cache.get("t1", factory)  # rebuild
         assert calls == ["t1", "t2", "t3", "t1"]
+
+
+class TestEmitAudit:
+    @pytest.mark.asyncio
+    async def test_sync_callback_receives_event(self):
+        events = []
+        config = TenancyConfig(on_query=events.append)
+        await emit_audit(config, {"tenant_schema": "t_a", "tool": "query_model"})
+        assert events == [{"tenant_schema": "t_a", "tool": "query_model"}]
+
+    @pytest.mark.asyncio
+    async def test_async_callback_awaited(self):
+        events = []
+
+        async def sink(event):
+            events.append(event)
+
+        config = TenancyConfig(on_query=sink)
+        await emit_audit(config, {"tool": "query_model"})
+        assert events == [{"tool": "query_model"}]
+
+    @pytest.mark.asyncio
+    async def test_no_callback_is_noop(self):
+        await emit_audit(TenancyConfig(), {"tool": "query_model"})
+
+    @pytest.mark.asyncio
+    async def test_callback_failure_logged_not_raised(self, caplog):
+        def boom(event):
+            raise RuntimeError("sink down")
+
+        config = TenancyConfig(on_query=boom)
+        with caplog.at_level("WARNING"):
+            await emit_audit(config, {"tool": "query_model"})
+        assert any("audit callback failed" in r.getMessage() for r in caplog.records)
