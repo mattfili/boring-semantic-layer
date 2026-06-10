@@ -32,7 +32,12 @@ for schema, carrier in [("tenant_alpha", "AA"), ("tenant_beta", "BB")]:
 
 
 def build_models(schema: str):
-    """Identical model shapes per tenant — only the bound schema differs."""
+    """Identical model shapes per tenant — only the bound schema differs.
+
+    This factory shares one engine-level connection (`con`) across schemas.
+    A factory that opens a connection PER schema must close it when the
+    tenant is evicted from the model cache — pass `on_evict` in TenancyConfig.
+    """
     tbl = con.table("flights", database=schema)
     model = (
         to_semantic_table(tbl, name="flights", description="Flights for one tenant")
@@ -45,6 +50,9 @@ def build_models(schema: str):
 mcp = MCPSemanticModel(
     models=build_models,
     tenancy=TenancyConfig(
+        # Always set the allowlist in production: verified tokens make claims
+        # trustworthy, but this is cheap defense-in-depth against a
+        # token-minting bug upstream. Omitting it logs a warning.
         allowed_schemas=frozenset({"tenant_alpha", "tenant_beta"}),
         on_query=lambda event: print(f"[audit] {event}"),
     ),

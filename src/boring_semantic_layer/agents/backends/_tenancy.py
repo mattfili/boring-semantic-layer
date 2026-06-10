@@ -34,19 +34,29 @@ class TenancyConfig:
     Attributes:
         schema_claim: Token claim holding the tenant's schema name.
         allowed_schemas: Optional allowlist; when set, claims resolving to a
-            schema outside it are rejected even if well-formed.
+            schema outside it are rejected even if well-formed. Strongly
+            recommended in production: verified tokens make claims
+            trustworthy, but the allowlist is cheap defense-in-depth against
+            a token-minting bug upstream.
         max_cached_tenants: LRU size for per-tenant model mappings.
         on_query: Optional audit callback (sync or async) receiving one dict
             per audited tool call: tenant_schema, tool, and tool-specific
             detail such as model/dimensions/measures/rowcount.
             Only successful calls are audited; failed calls raise before the
             audit point.
+        on_evict: Optional sync callback ``(schema, models)`` invoked when a
+            tenant's models are evicted from the LRU. Eviction only drops the
+            mapping — if the factory opened a per-schema connection, close it
+            here or it lingers until GC. Factories that share one engine-level
+            connection across schemas don't need this. Exceptions are logged,
+            never raised.
     """
 
     schema_claim: str = "schema"
     allowed_schemas: frozenset[str] | None = None
     max_cached_tenants: int = _DEFAULT_MAX_TENANTS
     on_query: Callable[[dict[str, Any]], Any] | None = None
+    on_evict: Callable[[str, Mapping[str, Any]], Any] | None = None
 
 
 def resolve_tenant_schema(token: Any, config: TenancyConfig) -> str:
@@ -80,10 +90,15 @@ class TenantModelCache:
     factory must not block other tenants — a rare duplicate build is fine).
     """
 
-    def __init__(self, maxsize: int = _DEFAULT_MAX_TENANTS):
+    def __init__(
+        self,
+        maxsize: int = _DEFAULT_MAX_TENANTS,
+        on_evict: Callable[[str, Mapping[str, Any]], Any] | None = None,
+    ):
         if maxsize < 1:
             raise ValueError("maxsize must be >= 1")
         self._maxsize = maxsize
+        self._on_evict = on_evict
         self._cache: OrderedDict[str, Mapping[str, Any]] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -98,12 +113,25 @@ class TenantModelCache:
                 self._cache.move_to_end(schema)
                 return self._cache[schema]
         models = factory(schema)
+        evicted: list[tuple[str, Mapping[str, Any]]] = []
         with self._lock:
             self._cache[schema] = models
             self._cache.move_to_end(schema)
             while len(self._cache) > self._maxsize:
-                evicted, _ = self._cache.popitem(last=False)
-                logger.info("tenancy: evicted cached models for schema %s", evicted)
+                evicted.append(self._cache.popitem(last=False))
+        # Callback runs outside the lock: a slow or re-entrant on_evict must
+        # not block other tenants. Failures are logged, never raised.
+        for evicted_schema, evicted_models in evicted:
+            logger.info("tenancy: evicted cached models for schema %s", evicted_schema)
+            if self._on_evict is not None:
+                try:
+                    self._on_evict(evicted_schema, evicted_models)
+                except Exception:
+                    logger.warning(
+                        "tenancy: on_evict callback failed for schema %s",
+                        evicted_schema,
+                        exc_info=True,
+                    )
         return models
 
 

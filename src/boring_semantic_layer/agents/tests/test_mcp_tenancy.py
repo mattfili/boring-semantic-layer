@@ -157,6 +157,17 @@ class TestConstructorValidation:
         )
         assert server._tenancy is not None
 
+    def test_missing_allowlist_warns(self, tenant_con, caplog):
+        """Tenancy without allowed_schemas works but warns — deployments
+        should copy the allowlisted shape for defense-in-depth."""
+        with caplog.at_level("WARNING"):
+            MCPSemanticModel(
+                models=make_factory(tenant_con),
+                tenancy=TenancyConfig(),
+                auth=StaticTokenVerifier(tokens=VERIFIER_TOKENS),
+            )
+        assert any("allowed_schemas" in r.getMessage() for r in caplog.records)
+
 
 class TestTenantIsolation:
     """Per-request tenant model resolution: each token sees only its schema."""

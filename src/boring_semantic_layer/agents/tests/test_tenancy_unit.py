@@ -92,6 +92,33 @@ class TestTenantModelCache:
         b = cache.get("tenant_b", lambda s: {"m": s})
         assert a != b
 
+    def test_on_evict_receives_schema_and_models(self):
+        evictions = []
+        cache = TenantModelCache(
+            maxsize=1, on_evict=lambda schema, models: evictions.append((schema, models))
+        )
+        cache.get("t1", lambda s: {"m": s})
+        cache.get("t2", lambda s: {"m": s})  # evicts t1
+        assert evictions == [("t1", {"m": "t1"})]
+
+    def test_on_evict_not_called_without_eviction(self):
+        evictions = []
+        cache = TenantModelCache(maxsize=2, on_evict=lambda s, m: evictions.append(s))
+        cache.get("t1", lambda s: {"m": s})
+        cache.get("t1", lambda s: {"m": s})  # cache hit, no eviction
+        assert evictions == []
+
+    def test_on_evict_failure_logged_not_raised(self, caplog):
+        def boom(schema, models):
+            raise RuntimeError("close failed")
+
+        cache = TenantModelCache(maxsize=1, on_evict=boom)
+        cache.get("t1", lambda s: {"m": s})
+        with caplog.at_level("WARNING"):
+            result = cache.get("t2", lambda s: {"m": s})  # evicts t1, callback raises
+        assert result == {"m": "t2"}
+        assert any("on_evict callback failed" in r.getMessage() for r in caplog.records)
+
     def test_lru_eviction_beyond_maxsize(self):
         calls = []
 

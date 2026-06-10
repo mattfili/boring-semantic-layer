@@ -298,11 +298,19 @@ class MCPSemanticModel(FastMCP):
 
         self._tenancy = tenancy
         if tenancy is not None:
+            if tenancy.allowed_schemas is None:
+                # Claims alone gate schema access without an allowlist; that is
+                # sound only while the token issuer never mints a bad claim.
+                logger.warning(
+                    "tenancy: no allowed_schemas configured — set an allowlist "
+                    "for defense-in-depth against upstream token-minting bugs"
+                )
             # Tenant mode: every read goes through the per-request resolver.
             # No static models; bundle skills are not supported.
             self._model_factory: Callable[[str], Mapping[str, Any]] = models  # type: ignore[assignment]
             self._tenant_models: TenantModelCache = TenantModelCache(
-                maxsize=tenancy.max_cached_tenants
+                maxsize=tenancy.max_cached_tenants,
+                on_evict=tenancy.on_evict,
             )
             self.models: Mapping[str, Any] = {}
             self._parent_skills: list[SkillMetadata] = []
