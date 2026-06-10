@@ -21,16 +21,15 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 from boring_semantic_layer import to_semantic_table
 from boring_semantic_layer.agents.backends._tenancy import TenancyConfig
-from boring_semantic_layer.agents.backends.mcp import MCPSemanticModel, _client_supports_elicitation
+from boring_semantic_layer.agents.backends.mcp import (
+    MCPSemanticModel,
+    _client_supports_elicitation,
+    _verify_session_tenant,
+)
 
 VERIFIER_TOKENS = {
     "token-alpha": {"client_id": "tenant-alpha", "scopes": ["bsl:read"], "schema": "tenant_alpha"},
     "token-beta": {"client_id": "tenant-beta", "scopes": ["bsl:read"], "schema": "tenant_beta"},
-    "token-admin-alpha": {
-        "client_id": "admin",
-        "scopes": ["bsl:read", "bsl:admin"],
-        "schema": "tenant_alpha",
-    },
     "token-no-claim": {"client_id": "no-claim", "scopes": ["bsl:read"]},
     "token-evil": {"client_id": "evil", "scopes": ["bsl:read"], "schema": "tenant_gamma"},
 }
@@ -344,3 +343,100 @@ class TestAudit:
         records = records_from(result)
         assert len(records) == 1
         assert records[0]["carrier"] == "AA"
+
+    @pytest.mark.asyncio
+    async def test_get_time_range_emits_audit_event(self, tenant_con):
+        """get_time_range emits one audit event with tenant_schema and tool name."""
+        events = []
+        # Build a table with a timestamp column so get_time_range succeeds
+        con = ibis.duckdb.connect(":memory:")
+        con.raw_sql("CREATE SCHEMA tenant_alpha")
+        df = pd.DataFrame(
+            {
+                "carrier": ["AA", "AA", "AA"],
+                "dep_delay": [1.0, 2.0, 3.0],
+                "dep_time": pd.to_datetime(["2024-01-01", "2024-02-01", "2024-03-01"]),
+            }
+        )
+        con.create_table("tenancy_flights_ts", df, database="tenant_alpha")
+
+        def ts_factory(schema: str):
+            tbl = con.table("tenancy_flights_ts", database=schema)
+            model = (
+                to_semantic_table(tbl, name="flights_ts")
+                .with_dimensions(
+                    carrier=lambda t: t.carrier,
+                    dep_time={
+                        "expr": lambda t: t.dep_time,
+                        "is_time_dimension": True,
+                        "smallest_time_grain": "day",
+                    },
+                )
+                .with_measures(flight_count=lambda t: t.count())
+            )
+            return {"flights_ts": model}
+
+        ts_tokens = {
+            "token-alpha-ts": {
+                "client_id": "tenant-alpha-ts",
+                "scopes": ["bsl:read"],
+                "schema": "tenant_alpha",
+            },
+        }
+        server = MCPSemanticModel(
+            models=ts_factory,
+            tenancy=TenancyConfig(
+                allowed_schemas=frozenset({"tenant_alpha"}),
+                on_query=events.append,
+            ),
+            auth=StaticTokenVerifier(tokens=ts_tokens),
+        )
+        async with tenant_client(server, "token-alpha-ts") as client:
+            await client.call_tool("get_time_range", {"model_name": "flights_ts"})
+
+        assert len(events) == 1
+        event = events[0]
+        assert event["tool"] == "get_time_range"
+        assert event["tenant_schema"] == "tenant_alpha"
+
+
+class TestSessionStateTenantBinding:
+    """_verify_session_tenant unit tests and single-tenant happy-path regression."""
+
+    def test_both_none_ok(self):
+        """Single-tenant: stored None == current None — must not raise."""
+        _verify_session_tenant(None, None)  # no exception
+
+    def test_matching_schemas_ok(self):
+        """Same schema on both sides — must not raise."""
+        _verify_session_tenant("tenant_alpha", "tenant_alpha")  # no exception
+
+    def test_mismatch_raises(self):
+        """Mismatched schemas must raise ToolError."""
+        with pytest.raises(ToolError, match="different tenant context"):
+            _verify_session_tenant("tenant_alpha", "tenant_beta")
+
+    def test_stored_none_current_set_raises(self):
+        """Stored schema None (pre-stamp record) vs current set schema must raise."""
+        with pytest.raises(ToolError, match="different tenant context"):
+            _verify_session_tenant(None, "tenant_alpha")
+
+    @pytest.mark.asyncio
+    async def test_single_tenant_summarize_results_no_mismatch_error(self, tenant_con):
+        """Single-tenant: query_model then summarize_results must not raise tenant-mismatch.
+
+        Both stored_schema and current_schema are None in single-tenant mode,
+        so _verify_session_tenant(None, None) must pass cleanly. ctx.sample()
+        is unavailable in the in-memory Client, so summarize_results falls back
+        to returning the prompt text — that's fine; the assertion is on the
+        absence of a ToolError about tenant context.
+        """
+        models = make_factory(tenant_con)("tenant_alpha")
+        server = MCPSemanticModel(models=models)
+        async with Client(server) as client:
+            await client.call_tool("query_model", QUERY_ARGS)
+            # Must not raise ToolError("different tenant context")
+            result = await client.call_tool("summarize_results", {})
+        text = result.content[0].text
+        assert isinstance(text, str)
+        assert len(text) > 0

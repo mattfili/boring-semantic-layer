@@ -73,6 +73,61 @@ def _parse_json_string(v: Any) -> Any:
     return v
 
 
+def _verify_session_tenant(stored_schema: str | None, current_schema: str | None) -> None:
+    """Refuse cross-tenant reads of session-cached results.
+
+    Session state is keyed by session, not token. If a proxy reused a session
+    across token rotations the cached result could belong to a different tenant.
+    Compare and refuse rather than leak.
+    """
+    if stored_schema != current_schema:
+        raise ToolError(
+            "Stored query results belong to a different tenant context; "
+            "run query_model again in this session."
+        )
+
+
+def _json_safe(val: Any) -> Any:
+    """Preserve JSON-serializable types; str() everything else."""
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    return str(val)
+
+
+def _fetch_top_values(base_agg: Any, n: int) -> tuple[list[dict], bool]:
+    """Fetch top n rows from an ibis aggregation, sorted by frequency descending.
+
+    Returns (values_list, is_complete). Executes via pyarrow then sorts there —
+    ibis order_by().limit() can hit infinite recursion on joined models.
+    """
+    tbl_pa = base_agg.to_pyarrow()
+    sorted_pa = tbl_pa.sort_by([("frequency", "descending")])
+    top = sorted_pa.slice(0, n + 1)
+    complete = top.num_rows <= n
+    result = top.slice(0, n)
+    values = [
+        {
+            "value": _json_safe(result.column("_value")[i].as_py()),
+            "count": int(result.column("frequency")[i].as_py()),
+        }
+        for i in range(result.num_rows)
+    ]
+    return values, complete
+
+
+def _rowcount_from_result(result: str) -> int | None:
+    """Record count from a serialized query result, or None when unknown.
+
+    None (not 0) when records were not requested or are unparsable — an
+    unknown count must not masquerade as an empty result.
+    """
+    try:
+        records = json.loads(result).get("records")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return len(records) if isinstance(records, list) else None
+
+
 def _build_model_info(model: Any) -> dict[str, Any]:
     """Build model metadata dict from a semantic model (shared by tool and resource)."""
     dimensions = {}
@@ -308,6 +363,20 @@ class MCPSemanticModel(FastMCP):
         schema = resolve_tenant_schema(get_access_token(), self._tenancy)
         return self._tenant_models.get(schema, self._model_factory)
 
+    async def _audit(self, tool: str, **detail: Any) -> None:
+        """Emit a per-tenant audit event; no-op on single-tenant servers.
+
+        Only successful tool calls are audited — error paths raise before
+        reaching the audit point, so this is a data-access log, not an
+        attempt log.
+        """
+        if self._tenancy is None:
+            return
+        await emit_audit(
+            self._tenancy,
+            {"tenant_schema": self._current_tenant_schema(), "tool": tool, **detail},
+        )
+
     async def run_async(
         self,
         transport=None,
@@ -378,7 +447,9 @@ class MCPSemanticModel(FastMCP):
         ) -> Mapping[str, Any]:
             """Return the time range for a model's time dimension."""
             model = await resolve_model(self._models_for_request(), model_name, ctx)
-            return _get_time_range_data(model, model_name)
+            result = _get_time_range_data(model, model_name)
+            await self._audit("get_time_range", model=model_name)
+            return result
 
         @self.tool(
             name="query_model",
@@ -532,11 +603,10 @@ class MCPSemanticModel(FastMCP):
             if ctx:
                 await ctx.report_progress(progress=90, total=100)
 
-                # Session state is tenant-scoped by session identity: a session
-                # is bound to one client connection and hence one token. If a
-                # proxy ever reuses sessions across token rotations, store the
-                # tenant schema alongside and compare on read.
-                # Store query in session state for follow-up tools
+                # Session state is keyed by session, not token. Store the
+                # tenant schema alongside the query so summarize_results can
+                # compare and refuse a cross-tenant read if a proxy ever reuses
+                # a session across token rotations.
                 await ctx.set_state(
                     "last_query",
                     {
@@ -548,36 +618,22 @@ class MCPSemanticModel(FastMCP):
                         "limit": limit,
                         "time_grain": time_grain,
                         "time_range": time_range,
+                        "tenant_schema": self._current_tenant_schema(),
                     },
                 )
                 await ctx.set_state("last_result", result)
 
                 await ctx.report_progress(progress=100, total=100)
 
-            if self._tenancy is not None:
-                # Rowcount comes from the serialized result's "records" list.
-                # None (not 0) when records were not requested or are unparsable
-                # — an unknown count must not masquerade as an empty result.
-                rowcount = None
-                try:
-                    records = json.loads(result).get("records")
-                    if isinstance(records, list):
-                        rowcount = len(records)
-                except (ValueError, TypeError, AttributeError):
-                    pass
-                await emit_audit(
-                    self._tenancy,
-                    {
-                        "tenant_schema": self._current_tenant_schema(),
-                        "tool": "query_model",
-                        "model": model_name,
-                        "dimensions": dimensions,
-                        "measures": measures,
-                        "filters": filters,
-                        "limit": limit,
-                        "rowcount": rowcount,
-                    },
-                )
+            await self._audit(
+                "query_model",
+                model=model_name,
+                dimensions=dimensions,
+                measures=measures,
+                filters=filters,
+                limit=limit,
+                rowcount=_rowcount_from_result(result),
+            )
 
             return result
 
@@ -653,32 +709,6 @@ class MCPSemanticModel(FastMCP):
             # Total distinct count (before applying search filter)
             total_distinct = int(agg.count().execute())
 
-            def _json_safe(val):
-                """Preserve JSON-serializable types; str() everything else."""
-                if val is None or isinstance(val, (bool, int, float, str)):
-                    return val
-                return str(val)
-
-            def _fetch(base_agg, n):
-                """Fetch top n+1 rows and return (values_list, is_complete).
-
-                Executes via pyarrow, then sorts there — ibis
-                order_by().limit() can hit infinite recursion on joined models.
-                """
-                tbl_pa = base_agg.to_pyarrow()
-                sorted_pa = tbl_pa.sort_by([("frequency", "descending")])
-                top = sorted_pa.slice(0, n + 1)
-                complete = top.num_rows <= n
-                result = top.slice(0, n)
-                values = [
-                    {
-                        "value": _json_safe(result.column("_value")[i].as_py()),
-                        "count": int(result.column("frequency")[i].as_py()),
-                    }
-                    for i in range(result.num_rows)
-                ]
-                return values, complete
-
             _SEP = r"[\s\-_.,]+"
 
             # Apply case-insensitive search filter if provided
@@ -696,32 +726,27 @@ class MCPSemanticModel(FastMCP):
                         .contains(search_normalized)
                     )
                 )
-                values, is_complete = _fetch(filtered_agg, limit)
+                values, is_complete = _fetch_top_values(filtered_agg, limit)
 
                 # Fallback: if search returned nothing, show top values as reference
                 if not values:
-                    fallback_values, is_complete = _fetch(agg, limit)
+                    fallback_values, is_complete = _fetch_top_values(agg, limit)
                     note = (
                         f"No matches found for '{search_term}'. "
                         "Showing top values for reference — use one of these exact spellings."
                     )
             else:
-                values, is_complete = _fetch(agg, limit)
+                values, is_complete = _fetch_top_values(agg, limit)
 
-            if self._tenancy is not None:
-                # Audit both shapes: matched values AND the no-match fallback —
-                # the fallback still returns real dimension values.
-                await emit_audit(
-                    self._tenancy,
-                    {
-                        "tenant_schema": self._current_tenant_schema(),
-                        "tool": "search_dimension_values",
-                        "model": model_name,
-                        "dimension": dimension_name,
-                        "search_term": search_term,
-                        "rowcount": len(fallback_values if fallback_values is not None else values),
-                    },
-                )
+            # Audit both shapes: matched values AND the no-match fallback —
+            # the fallback still returns real dimension values.
+            await self._audit(
+                "search_dimension_values",
+                model=model_name,
+                dimension=dimension_name,
+                search_term=search_term,
+                rowcount=len(fallback_values if fallback_values is not None else values),
+            )
 
             response = {
                 "total_distinct": total_distinct,
@@ -763,6 +788,14 @@ class MCPSemanticModel(FastMCP):
                 raise ToolError(
                     "No previous query results found in this session. Run query_model first."
                 )
+
+            # Session state is keyed by session, not token; if a proxy reused a
+            # session across token rotations the cached result could belong to a
+            # different tenant. Compare and refuse rather than leak.
+            _verify_session_tenant(
+                (last_query or {}).get("tenant_schema"),
+                self._current_tenant_schema(),
+            )
 
             prompt_parts = [
                 "Analyze the following semantic layer query results and provide "

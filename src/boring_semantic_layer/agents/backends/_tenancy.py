@@ -35,17 +35,16 @@ class TenancyConfig:
         schema_claim: Token claim holding the tenant's schema name.
         allowed_schemas: Optional allowlist; when set, claims resolving to a
             schema outside it are rejected even if well-formed.
-        admin_scope: OAuth scope required for admin-only components
-            (e.g. schema tools) when tenancy is enabled.
         max_cached_tenants: LRU size for per-tenant model mappings.
         on_query: Optional audit callback (sync or async) receiving one dict
             per audited tool call: tenant_schema, tool, and tool-specific
             detail such as model/dimensions/measures/rowcount.
+            Only successful calls are audited; failed calls raise before the
+            audit point.
     """
 
     schema_claim: str = "schema"
     allowed_schemas: frozenset[str] | None = None
-    admin_scope: str = "bsl:admin"
     max_cached_tenants: int = _DEFAULT_MAX_TENANTS
     on_query: Callable[[dict[str, Any]], Any] | None = None
 
