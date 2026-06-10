@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
-import anyio
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
@@ -34,11 +33,6 @@ from ._tenancy import TenancyConfig, TenantModelCache, resolve_tenant_schema
 load_dotenv()
 
 _find_time_dimension = find_time_dimension  # backwards-compat alias
-
-# Elicitation timeout: clients that don't support elicitation may hang
-# indefinitely rather than raising immediately. Bail out quickly so the tool
-# error path is reached without blocking the request.
-_ELICIT_TIMEOUT_S = 3.0
 
 
 def _get_prompts_dir() -> Path:
@@ -135,6 +129,19 @@ class ModelSelection:
     model_name: str
 
 
+def _client_supports_elicitation(ctx: Context) -> bool:
+    """True if the connected client advertised the elicitation capability.
+
+    Calling ctx.elicit() against a client without the capability can hang
+    indefinitely on HTTP transports, so callers must check first.
+    """
+    try:
+        params = ctx.session.client_params
+    except AttributeError:
+        return False
+    return bool(params and getattr(params.capabilities, "elicitation", None))
+
+
 async def resolve_model(
     models: Mapping[str, Any],
     model_name: str,
@@ -142,31 +149,30 @@ async def resolve_model(
 ) -> Any:
     """Resolve a model by name, using elicitation if available and model not found.
 
-    Elicitation is attempted with a short timeout (_ELICIT_TIMEOUT_S) so that
-    clients which do not support it (and hang instead of raising) degrade
-    quickly to the ToolError path rather than blocking the request indefinitely.
+    Elicitation is only attempted when the connected client has advertised the
+    elicitation capability; clients without it would hang indefinitely on HTTP
+    transports.
     """
     if model_name in models:
         return models[model_name]
 
     # Try elicitation to let the user pick the correct model
-    if ctx:
+    if ctx and _client_supports_elicitation(ctx):
         available = list(models.keys())
         try:
-            with anyio.fail_after(_ELICIT_TIMEOUT_S):
-                response = await ctx.elicit(
-                    f"Model '{model_name}' not found. "
-                    f"Available models: {', '.join(available)}. "
-                    f"Which model did you mean?",
-                    response_type=ModelSelection,
-                )
+            response = await ctx.elicit(
+                f"Model '{model_name}' not found. "
+                f"Available models: {', '.join(available)}. "
+                f"Which model did you mean?",
+                response_type=ModelSelection,
+            )
             if response.action == "accept" and response.data:
                 picked = response.data.model_name
                 if picked in models:
                     await ctx.info(f"Resolved to model '{picked}'")
                     return models[picked]
         except Exception:
-            pass  # Client doesn't support elicitation, or timed out — fall through
+            pass  # Belt-and-braces: elicitation failed — fall through
 
     raise ToolError(f"Model '{model_name}' not found. Available models: {list(models.keys())}")
 
@@ -553,7 +559,7 @@ class MCPSemanticModel(FastMCP):
             if dimension_name not in dims:
                 # Try elicitation to let the user pick the correct dimension
                 resolved = False
-                if ctx:
+                if ctx and _client_supports_elicitation(ctx):
                     try:
 
                         @dataclass
