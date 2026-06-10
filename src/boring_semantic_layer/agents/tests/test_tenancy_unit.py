@@ -139,3 +139,10 @@ class TestEmitAudit:
         with caplog.at_level("WARNING"):
             await emit_audit(config, {"tool": "query_model"})
         assert any("audit callback failed" in r.getMessage() for r in caplog.records)
+
+
+def test_tenancy_config_lazy_export():
+    """TenancyConfig is importable from the package root (lazy, mcp extra)."""
+    import boring_semantic_layer as bsl
+
+    assert bsl.TenancyConfig is TenancyConfig

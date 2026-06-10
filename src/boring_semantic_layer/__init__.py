@@ -63,6 +63,7 @@ __all__ = [
     "SkillMetadata",
     "MCPSemanticModel",
     "LangGraphBackend",
+    "TenancyConfig",
     "options",
     "graph_bfs",
     "graph_invert",
@@ -95,5 +96,15 @@ def __getattr__(name):
             raise ImportError(
                 "LangGraphBackend requires the 'agent' optional dependencies. "
                 "Install with: pip install 'boring-semantic-layer[agent]'"
+            ) from None
+    if name == "TenancyConfig":
+        try:
+            from .agents.backends._tenancy import TenancyConfig
+
+            return TenancyConfig
+        except ImportError:
+            raise ImportError(
+                "TenancyConfig requires the 'mcp' optional dependencies. "
+                "Install with: pip install 'boring-semantic-layer[mcp]'"
             ) from None
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
