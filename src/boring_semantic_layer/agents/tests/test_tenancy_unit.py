@@ -43,13 +43,18 @@ class TestResolveTenantSchema:
         with pytest.raises(ToolError, match="missing the 'schema' claim"):
             resolve_tenant_schema(token, TenancyConfig())
 
+    def test_empty_string_claim_treated_as_missing(self):
+        token = FakeToken({"schema": ""})
+        with pytest.raises(ToolError, match="missing the 'schema' claim"):
+            resolve_tenant_schema(token, TenancyConfig())
+
     @pytest.mark.parametrize(
         "bad",
-        ["tenant-a; DROP TABLE x", "a.b", 'a"b', "1tenant", "", "tenant a"],
+        ["tenant-a; DROP TABLE x", "a.b", 'a"b', "1tenant", "tenant a", "tenant_a\n"],
     )
     def test_invalid_identifier_raises(self, bad):
         token = FakeToken({"schema": bad})
-        with pytest.raises(ToolError, match="not a valid schema identifier|missing the"):
+        with pytest.raises(ToolError, match="not a valid schema identifier"):
             resolve_tenant_schema(token, TenancyConfig())
 
     def test_allowlist_blocks_unknown_schema(self):
@@ -65,6 +70,10 @@ class TestResolveTenantSchema:
 
 
 class TestTenantModelCache:
+    def test_maxsize_must_be_positive(self):
+        with pytest.raises(ValueError, match="maxsize"):
+            TenantModelCache(maxsize=0)
+
     def test_factory_called_once_per_schema(self):
         calls = []
 

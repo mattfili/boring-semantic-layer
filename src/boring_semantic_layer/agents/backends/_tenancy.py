@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 # verify but do not mint — never interpolate an unvalidated claim near SQL.
 _SCHEMA_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+_DEFAULT_MAX_TENANTS = 32
+
 
 @dataclass(frozen=True)
 class TenancyConfig:
@@ -44,7 +46,7 @@ class TenancyConfig:
     schema_claim: str = "schema"
     allowed_schemas: frozenset[str] | None = None
     admin_scope: str = "bsl:admin"
-    max_cached_tenants: int = 32
+    max_cached_tenants: int = _DEFAULT_MAX_TENANTS
     on_query: Callable[[dict[str, Any]], Any] | None = None
 
 
@@ -65,7 +67,7 @@ def resolve_tenant_schema(token: Any, config: TenancyConfig) -> str:
             f"Access token is missing the '{config.schema_claim}' claim "
             "required for tenant resolution."
         )
-    if not _SCHEMA_IDENT.match(schema):
+    if not _SCHEMA_IDENT.fullmatch(schema):
         raise ToolError("Tenant schema claim is not a valid schema identifier.")
     if config.allowed_schemas is not None and schema not in config.allowed_schemas:
         raise ToolError("Tenant schema is not among the allowed schemas for this server.")
@@ -79,7 +81,9 @@ class TenantModelCache:
     factory must not block other tenants — a rare duplicate build is fine).
     """
 
-    def __init__(self, maxsize: int = 32):
+    def __init__(self, maxsize: int = _DEFAULT_MAX_TENANTS):
+        if maxsize < 1:
+            raise ValueError("maxsize must be >= 1")
         self._maxsize = maxsize
         self._cache: OrderedDict[str, Mapping[str, Any]] = OrderedDict()
         self._lock = threading.Lock()
