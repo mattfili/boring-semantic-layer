@@ -2,6 +2,7 @@
 
 import re
 import subprocess
+import sys
 from argparse import Namespace
 from pathlib import Path
 
@@ -285,9 +286,13 @@ class TestSkillInstallIntegration:
         # Get the BSL source directory (parent of src/boring_semantic_layer)
         bsl_source = Path(__file__).parent.parent.parent.parent.parent
 
-        # Initialize a uv project
+        # Initialize a uv project pinned to the interpreter running this test.
+        # An unpinned project resolves to the newest Python on the host, which
+        # may have no pyarrow wheels yet (e.g. 3.14) and force a doomed
+        # source build of Arrow.
+        python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         result = subprocess.run(
-            ["uv", "init"],
+            ["uv", "init", "--python", python_version],
             cwd=project_dir,
             capture_output=True,
             text=True,
