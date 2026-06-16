@@ -20,6 +20,7 @@ from ...skills import SkillMetadata
 from ...yaml import SemanticModelBundle
 from ..utils.chart_handler import generate_chart_with_data
 from ..utils.prompts import load_prompt
+from ._schema_mcp import register_schema_tools
 from ._skill_mcp import (
     WRITE_ANNOTATIONS,
     build_domain_context,
@@ -146,7 +147,10 @@ def _build_model_info(model: Any) -> dict[str, Any]:
         "name": model.name or "unnamed",
         "dimensions": dimensions,
         "measures": measures,
-        "calculated_measures": list(model.get_calculated_measures().keys()),
+        "calculated_measures": {
+            name: {"description": getattr(val, "description", None)}
+            for name, val in model.get_calculated_measures().items()
+        },
     }
 
     if model.description:
@@ -276,6 +280,7 @@ class MCPSemanticModel(FastMCP):
         include_domain_context_tool: bool = True,
         include_add_skill_tool: bool = True,
         tenancy: TenancyConfig | None = None,
+        include_schema_tools: bool = False,
         **kwargs,
     ):
         """Initialise the MCP semantic-layer server.
@@ -351,6 +356,9 @@ class MCPSemanticModel(FastMCP):
                 self._register_domain_context_tool()
             if include_add_skill_tool:
                 self._register_add_skill_tool()
+
+        if include_schema_tools:
+            register_schema_tools(self, PROMPTS_DIR)
 
     def _current_tenant_schema(self) -> str | None:
         """Return the tenant schema for this request, or None on single-tenant servers."""

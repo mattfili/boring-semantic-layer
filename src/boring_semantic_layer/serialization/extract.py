@@ -16,7 +16,6 @@ from returns.result import Result, Success, safe
 from .context import BSLSerializationContext
 from .helpers import extract_simple_column_name
 
-
 # ---------------------------------------------------------------------------
 # singledispatch extractors
 # ---------------------------------------------------------------------------
@@ -304,7 +303,15 @@ def serialize_measures(measures: Mapping[str, Any]) -> Result[dict, Exception]:
 def serialize_calc_measures(calc_measures: Mapping[str, Any]) -> Result[dict, Exception]:
     @safe
     def do_serialize():
-        from ..measure_scope import AggregationExpr, AllOf, BinOp, MeasureRef, MethodCall
+        from ..measure_scope import (
+            AggregationExpr,
+            AllOf,
+            BinOp,
+            DescribedMeasure,
+            MeasureRef,
+            MethodCall,
+            unwrap_calc_expr,
+        )
 
         def _serialize_calc_expr(expr):
             if isinstance(expr, MeasureRef):
@@ -334,17 +341,27 @@ def serialize_calc_measures(calc_measures: Mapping[str, Any]) -> Result[dict, Ex
 
         result = {}
         for name, expr in calc_measures.items():
-            serialized = _serialize_calc_expr(expr)
+            raw = unwrap_calc_expr(expr)
+            serialized = _serialize_calc_expr(raw)
             if serialized is not None:
-                result[name] = serialized
+                if isinstance(expr, DescribedMeasure) and expr.description:
+                    result[name] = {"expr": serialized, "description": expr.description}
+                else:
+                    result[name] = serialized
         return result
 
     return do_serialize()
 
 
 def deserialize_calc_measures(calc_data: Mapping[str, Any]) -> dict[str, Any]:
-    from ..measure_scope import AggregationExpr, AllOf, BinOp, MeasureRef, MethodCall
-
+    from ..measure_scope import (
+        AggregationExpr,
+        AllOf,
+        BinOp,
+        DescribedMeasure,
+        MeasureRef,
+        MethodCall,
+    )
     from .freeze import list_to_tuple
 
     def _deserialize_calc_expr(data):
@@ -374,4 +391,11 @@ def deserialize_calc_measures(calc_data: Mapping[str, Any]) -> dict[str, Any]:
             return data[1]
         raise ValueError(f"Unknown calc measure tag: {tag}")
 
-    return {name: _deserialize_calc_expr(expr) for name, expr in calc_data.items()}
+    def _deserialize_entry(data):
+        if isinstance(data, dict) and "expr" in data:
+            raw = _deserialize_calc_expr(data["expr"])
+            desc = data.get("description")
+            return DescribedMeasure(expr=raw, description=desc) if desc else raw
+        return _deserialize_calc_expr(data)
+
+    return {name: _deserialize_entry(expr) for name, expr in calc_data.items()}

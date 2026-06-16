@@ -8,7 +8,6 @@ from functools import reduce
 from typing import TYPE_CHECKING, Any
 
 import ibis
-from xorq.api import selectors as s
 from attrs import field, frozen
 from ibis.common.deferred import Deferred
 from ibis.expr import datatypes as dt
@@ -16,6 +15,7 @@ from ibis.expr import operations as ibis_ops
 from ibis.expr import types as ir
 from ibis.expr.operations.relations import Field, Relation
 from ibis.expr.schema import Schema
+from xorq.api import selectors as s
 
 try:
     from xorq.vendor.ibis.common.collections import FrozenDict, FrozenOrderedDict
@@ -53,9 +53,11 @@ from .measure_scope import (
     AllOf,
     BinOp,
     ColumnScope,
+    DescribedMeasure,
     MeasureRef,
     MeasureScope,
     MethodCall,
+    unwrap_calc_expr,
 )
 from .nested_access import NestedAccessMarker
 
@@ -217,7 +219,7 @@ def _patch_xorq_sortkey_compat():
     @map_ibis.register(IbisSortKey)
     def _map_sort_key(val, kwargs=None):
         # ibis 12 uses .arg, ibis 11 uses .expr
-        sort_expr = getattr(val, "arg", None) or getattr(val, "expr")
+        sort_expr = getattr(val, "arg", None) or val.expr
         return XorqSortKey(
             expr=map_ibis(sort_expr, None),
             ascending=val.ascending,
@@ -850,7 +852,8 @@ def _classify_measure(fn_or_expr: Any, scope: Any) -> tuple[str, Any]:
     )
 
     if isinstance(resolved, Success) and resolved.unwrap() is not None:
-        return resolved.unwrap()
+        _, val = resolved.unwrap()
+        return ("calc", DescribedMeasure(expr=val, description=description))
 
     if not requires_unnest and callable(expr):
         # All scopes (MeasureScope, ColumnScope) have tbl attribute
@@ -1139,7 +1142,9 @@ class SemanticTableOp(Relation):
             if dummy is not None:
                 for name, expr in calc_measures.items():
                     try:
-                        compiled = _compile_formula(expr, dummy, dummy, enriched)
+                        compiled = _compile_formula(
+                            unwrap_calc_expr(expr), dummy, dummy, enriched
+                        )
                         base_values[name] = compiled.op()
                     except Exception:
                         pass
@@ -1530,7 +1535,7 @@ def _create_measure_spec(
     if isinstance(val, MeasureRef):
         ref_name = val.name
         if ref_name in merged_calc_measures:
-            calc_expr = merged_calc_measures[ref_name]
+            calc_expr = unwrap_calc_expr(merged_calc_measures[ref_name])
             resolved = _resolve_aggregation_exprs(
                 calc_expr, merged_base_measures, merged_calc_measures, tbl
             )
@@ -1603,7 +1608,10 @@ def _expand_calc_measure_refs(
             raise ValueError(f"Circular calculated measure dependency detected: {cycle}")
 
         resolved = _resolve_aggregation_exprs(
-            merged_calc_measures[ref_name], merged_base_measures, merged_calc_measures, tbl
+            unwrap_calc_expr(merged_calc_measures[ref_name]),
+            merged_base_measures,
+            merged_calc_measures,
+            tbl,
         )
         expanded = _expand_calc_measure_refs(
             resolved,
@@ -1779,7 +1787,7 @@ def _find_deferrable_joins(
     group_by_keys: tuple[str, ...],
     agg_names: dict,
     all_roots: list,
-    join_tree_info: "_JoinTreeInfo",
+    join_tree_info: _JoinTreeInfo,
     filters: list | None = None,
 ) -> list[_DeferrableJoin]:
     """Identify join_one ops that can be deferred until after aggregation.
@@ -2767,9 +2775,9 @@ class SemanticAggregateOp(Relation):
     def _to_untagged_with_deferred_joins(
         self,
         all_roots: list,
-        join_op: "SemanticJoinOp",
-        join_tree_info: "_JoinTreeInfo",
-        deferrable: list["_DeferrableJoin"],
+        join_op: SemanticJoinOp,
+        join_tree_info: _JoinTreeInfo,
+        deferrable: list[_DeferrableJoin],
         filters: list | None = None,
     ):
         """Aggregate first, then LEFT JOIN deferred dimension tables.
@@ -4907,12 +4915,18 @@ def _merge_fields_with_prefixing(
     if all_roots:
         sample_fields = field_accessor(all_roots[0])
         if sample_fields:
-            from .measure_scope import AllOf, BinOp, MeasureRef, MethodCall
+            from .measure_scope import (
+                AllOf,
+                BinOp,
+                DescribedMeasure,
+                MeasureRef,
+                MethodCall,
+            )
 
             first_val = next(iter(sample_fields.values()), None)
             is_calc_measures = isinstance(
                 first_val,
-                MeasureRef | AllOf | BinOp | MethodCall | int | float,
+                MeasureRef | AllOf | BinOp | MethodCall | DescribedMeasure | int | float,
             )
             is_dimensions = isinstance(first_val, Dimension)
 
@@ -4945,7 +4959,17 @@ def _merge_fields_with_prefixing(
 
                 # If it's a calculated measure, update internal MeasureRefs
                 if is_calc_measures:
-                    field_value = _update_measure_refs_in_calc(field_value, prefix_map)
+                    if isinstance(field_value, DescribedMeasure):
+                        updated = _update_measure_refs_in_calc(
+                            field_value.expr, prefix_map
+                        )
+                        field_value = DescribedMeasure(
+                            expr=updated, description=field_value.description
+                        )
+                    else:
+                        field_value = _update_measure_refs_in_calc(
+                            field_value, prefix_map
+                        )
                 # If it's a dimension that needs column renaming, wrap the callable
                 elif is_dimensions and prefixed_name in column_rename_map:
                     field_value = _wrap_dimension_for_renamed_column(

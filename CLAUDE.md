@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # boring-semantic-layer
 
 Semantic layer built on ibis. Wraps ibis tables with dimension/measure metadata, then exposes them over MCP (FastMCP 3.0), LangChain agents, or direct Python API.
@@ -38,12 +42,15 @@ src/boring_semantic_layer/
 ├── config.py               # Global options
 ├── measure_scope.py        # AST for calculated measures
 ├── graph_utils.py          # BFS dependency graph traversal
+├── compile_all.py          # Bulk compilation helpers (ibis pipelines via toolz)
+├── skills.py               # Skill discovery (SKILL.md + frontmatter) for MCP-served domain context
 ├── convert.py              # @convert.register — lower SemanticOps → ibis expressions
 ├── format.py               # @fmt.register — pretty printing
 ├── utils.py                # safe_eval() for YAML expressions (AST-validated, no exec)
 ├── nested_access.py        # Malloy-style automatic nested array access
 ├── projection_utils.py     # Projection pushdown, TableRequirements
 ├── serialization/          # to_tagged/from_tagged — xorq roundtrip serialization
+├── server/                 # HTTP API backend (FastAPI) — api.py, loader.py
 ├── chart/                  # 5 viz backends: altair, plotly, plotext, echarts, md_parser
 │   ├── base.py             # ChartBackend ABC
 │   ├── altair_chart.py     # Vega-Lite JSON specs
@@ -154,6 +161,7 @@ All tool descriptions load from `docs/md/prompts/query/mcp/*.md` (23 files). The
 |-------|-----------------|---------------|
 | `mcp` | `fastmcp>=3.0.0` | `MCPSemanticModel` |
 | `mcp-code-mode` | `fastmcp[code-mode]>=3.1.0` | CodeMode transforms |
+| `server` | `fastapi`, `uvicorn[standard]` | HTTP API server (`server/`) |
 | `agent` | langchain, rich, plotext | `LangGraphBackend`, CLI |
 | `viz-altair` | altair, vl-convert | Altair chart backend |
 | `viz-plotly` | plotly, kaleido | Plotly chart backend |

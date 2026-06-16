@@ -174,6 +174,19 @@ class AggregationExpr(_Node):
 MeasureExpr = MeasureRef | AllOf | BinOp | MethodCall | AggregationExpr | float | int
 
 
+@frozen
+class DescribedMeasure:
+    """Wrapper that pairs a calc-measure AST expression with its description."""
+
+    expr: Any
+    description: str | None = None
+
+
+def unwrap_calc_expr(expr):
+    """Strip DescribedMeasure wrapper, returning the raw AST node."""
+    return expr.expr if isinstance(expr, DescribedMeasure) else expr
+
+
 class DeferredColumn:
     _AGGREGATIONS = {
         "sum": "sum",

@@ -90,7 +90,10 @@ def _build_model_response(model: Any) -> dict[str, Any]:
         "name": model.name or "unnamed",
         "dimensions": dimensions,
         "measures": measures,
-        "calculated_measures": list(model.get_calculated_measures().keys()),
+        "calculated_measures": {
+            name: {"description": getattr(val, "description", None)}
+            for name, val in model.get_calculated_measures().items()
+        },
     }
     if model.description:
         response["description"] = model.description

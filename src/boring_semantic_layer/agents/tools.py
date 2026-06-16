@@ -256,9 +256,12 @@ class BSLTools:
             result["description"] = model.description
 
         # Include calculated measures if any
-        calc_measures = list(model.get_calculated_measures().keys())
-        if calc_measures:
-            result["calculated_measures"] = calc_measures
+        calc = model.get_calculated_measures()
+        if calc:
+            result["calculated_measures"] = {
+                name: getattr(val, "description", None) or "calculated measure"
+                for name, val in calc.items()
+            }
 
         return json.dumps(result, indent=2)
 
