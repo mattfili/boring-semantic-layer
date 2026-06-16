@@ -1,7 +1,8 @@
 import json
+import logging
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -9,6 +10,7 @@ from typing import Annotated, Any
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_access_token
 from mcp.types import Annotations, ToolAnnotations
 from pydantic import Field
 from pydantic.functional_validators import BeforeValidator
@@ -28,8 +30,11 @@ from ._skill_mcp import (
     validate_skill_name,
     write_skill,
 )
+from ._tenancy import TenancyConfig, TenantModelCache, emit_audit, resolve_tenant_schema
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 _find_time_dimension = find_time_dimension  # backwards-compat alias
 
@@ -67,6 +72,61 @@ def _parse_json_string(v: Any) -> Any:
         except (json.JSONDecodeError, ValueError):
             return v
     return v
+
+
+def _verify_session_tenant(stored_schema: str | None, current_schema: str | None) -> None:
+    """Refuse cross-tenant reads of session-cached results.
+
+    Session state is keyed by session, not token. If a proxy reused a session
+    across token rotations the cached result could belong to a different tenant.
+    Compare and refuse rather than leak.
+    """
+    if stored_schema != current_schema:
+        raise ToolError(
+            "Stored query results belong to a different tenant context; "
+            "run query_model again in this session."
+        )
+
+
+def _json_safe(val: Any) -> Any:
+    """Preserve JSON-serializable types; str() everything else."""
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    return str(val)
+
+
+def _fetch_top_values(base_agg: Any, n: int) -> tuple[list[dict], bool]:
+    """Fetch top n rows from an ibis aggregation, sorted by frequency descending.
+
+    Returns (values_list, is_complete). Executes via pyarrow then sorts there —
+    ibis order_by().limit() can hit infinite recursion on joined models.
+    """
+    tbl_pa = base_agg.to_pyarrow()
+    sorted_pa = tbl_pa.sort_by([("frequency", "descending")])
+    top = sorted_pa.slice(0, n + 1)
+    complete = top.num_rows <= n
+    result = top.slice(0, n)
+    values = [
+        {
+            "value": _json_safe(result.column("_value")[i].as_py()),
+            "count": int(result.column("frequency")[i].as_py()),
+        }
+        for i in range(result.num_rows)
+    ]
+    return values, complete
+
+
+def _rowcount_from_result(result: str) -> int | None:
+    """Record count from a serialized query result, or None when unknown.
+
+    None (not 0) when records were not requested or are unparsable — an
+    unknown count must not masquerade as an empty result.
+    """
+    try:
+        records = json.loads(result).get("records")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return len(records) if isinstance(records, list) else None
 
 
 def _build_model_info(model: Any) -> dict[str, Any]:
@@ -131,17 +191,62 @@ class ModelSelection:
     model_name: str
 
 
+def _client_supports_elicitation(ctx: Context) -> bool:
+    """True if the connected client advertised the elicitation capability.
+
+    Calling ctx.elicit() against a client without the capability can hang
+    indefinitely on HTTP transports, so callers must check first.
+    """
+    try:
+        params = ctx.session.client_params
+    except AttributeError:
+        return False
+    return bool(params and getattr(params.capabilities, "elicitation", None))
+
+
+def _validate_tenancy_contract(models, tenancy, auth) -> bool:
+    """Validate the tenant-mode constructor contract; return is_factory.
+
+    Tenant mode requires a per-schema factory (a static mapping would serve
+    one tenant's data to all tenants) and a verifier (unverified claims
+    cannot scope anything).
+    """
+    is_factory = callable(models) and not isinstance(models, Mapping)
+    if tenancy is not None:
+        if not is_factory:
+            raise ValueError(
+                "Multi-tenant mode requires `models` to be a callable "
+                "(schema: str) -> Mapping[str, SemanticTable]."
+            )
+        if auth is None:
+            raise ValueError(
+                "Multi-tenant mode requires an auth provider (`auth=`); "
+                "without token verification, tenant claims cannot be trusted."
+            )
+    elif is_factory:
+        raise ValueError(
+            "`models` was passed as a callable but `tenancy` is not set; "
+            "pass tenancy=TenancyConfig(...) or a static mapping."
+        )
+    return is_factory
+
+
 async def resolve_model(
     models: Mapping[str, Any],
     model_name: str,
     ctx: Context | None,
 ) -> Any:
-    """Resolve a model by name, using elicitation if available and model not found."""
+    """Resolve a model by name, using elicitation if available and model not found.
+
+    Elicitation is only attempted when the connected client has advertised the
+    elicitation capability; clients without it would hang indefinitely on HTTP
+    transports.
+    """
     if model_name in models:
         return models[model_name]
 
     # Try elicitation to let the user pick the correct model
-    if ctx:
+    if ctx and _client_supports_elicitation(ctx):
         available = list(models.keys())
         try:
             response = await ctx.elicit(
@@ -156,7 +261,8 @@ async def resolve_model(
                     await ctx.info(f"Resolved to model '{picked}'")
                     return models[picked]
         except Exception:
-            pass  # Client doesn't support elicitation — fall through to error
+            logger.debug("elicitation fallback: client elicit failed", exc_info=True)
+            # Belt-and-braces: elicitation failed — fall through
 
     raise ToolError(f"Model '{model_name}' not found. Available models: {list(models.keys())}")
 
@@ -167,30 +273,63 @@ _resolve_model = resolve_model  # backwards-compat alias
 class MCPSemanticModel(FastMCP):
     def __init__(
         self,
-        models: Mapping[str, Any] | SemanticModelBundle,
+        models: Mapping[str, Any] | SemanticModelBundle | Callable[[str], Mapping[str, Any]],
         name: str = "Semantic Layer MCP Server",
         instructions: str = SYSTEM_INSTRUCTIONS,
         code_mode: bool = False,
         include_domain_context_tool: bool = True,
         include_add_skill_tool: bool = True,
+        tenancy: TenancyConfig | None = None,
         include_schema_tools: bool = False,
         **kwargs,
     ):
+        """Initialise the MCP semantic-layer server.
+
+        Args:
+            models: Either a static ``Mapping[str, SemanticTable]``, a
+                ``SemanticModelBundle`` (from ``from_yaml``), or — in tenant mode —
+                a callable ``(schema: str) -> Mapping[str, SemanticTable]`` that
+                builds the model set for one tenant's schema.
+            tenancy: When provided, enables schema-per-tenant mode. ``models`` must be
+                a factory callable and ``auth`` must also be supplied.
+            **kwargs: Forwarded to ``FastMCP.__init__`` (e.g. ``auth=``, ``port=``).
+        """
+        _validate_tenancy_contract(models, tenancy, kwargs.get("auth"))
+
         transforms = kwargs.pop("transforms", [])
         if code_mode:
             transforms = [*transforms, *_build_code_mode_transforms()]
         super().__init__(name=name, instructions=instructions, transforms=transforms, **kwargs)
 
-        # Extract skills metadata if a bundle was passed; otherwise treat as
-        # a plain mapping for backward compatibility.
-        if isinstance(models, SemanticModelBundle):
+        self._tenancy = tenancy
+        if tenancy is not None:
+            if tenancy.allowed_schemas is None:
+                # Claims alone gate schema access without an allowlist; that is
+                # sound only while the token issuer never mints a bad claim.
+                logger.warning(
+                    "tenancy: no allowed_schemas configured — set an allowlist "
+                    "for defense-in-depth against upstream token-minting bugs"
+                )
+            # Tenant mode: every read goes through the per-request resolver.
+            # No static models; bundle skills are not supported.
+            self._model_factory: Callable[[str], Mapping[str, Any]] = models  # type: ignore[assignment]
+            self._tenant_models: TenantModelCache = TenantModelCache(
+                maxsize=tenancy.max_cached_tenants,
+                on_evict=tenancy.on_evict,
+            )
+            self.models: Mapping[str, Any] = {}
+            self._parent_skills: list[SkillMetadata] = []
+            self._model_skills: dict[str, list[SkillMetadata]] = {}
+            self._parent_skills_dir: Path | None = None
+            self._model_skills_dirs: dict[str, Path] = {}
+        elif isinstance(models, SemanticModelBundle):
+            # Extract skills metadata if a bundle was passed; otherwise treat as
+            # a plain mapping for backward compatibility.
             self.models = models
-            self._parent_skills: list[SkillMetadata] = list(models.parent_skills)
-            self._model_skills: dict[str, list[SkillMetadata]] = {
-                k: list(v) for k, v in models.model_skills.items()
-            }
-            self._parent_skills_dir: Path | None = models.parent_skills_dir
-            self._model_skills_dirs: dict[str, Path] = dict(models.model_skills_dirs)
+            self._parent_skills = list(models.parent_skills)
+            self._model_skills = {k: list(v) for k, v in models.model_skills.items()}
+            self._parent_skills_dir = models.parent_skills_dir
+            self._model_skills_dirs = dict(models.model_skills_dirs)
         else:
             self.models = models
             self._parent_skills = []
@@ -221,6 +360,72 @@ class MCPSemanticModel(FastMCP):
         if include_schema_tools:
             register_schema_tools(self, PROMPTS_DIR)
 
+    def _current_tenant_schema(self) -> str | None:
+        """Return the tenant schema for this request, or None on single-tenant servers."""
+        if self._tenancy is None:
+            return None
+        return resolve_tenant_schema(get_access_token(), self._tenancy)
+
+    def _models_for_request(self) -> Mapping[str, Any]:
+        """Return the model mapping for the current request.
+
+        Single-tenant: the static mapping. Multi-tenant: models built (or
+        cached) for the schema named by the request token's claims — the
+        request can never execute against any other schema because every
+        table reference is created from this mapping.
+        """
+        if self._tenancy is None:
+            return self.models
+        schema = resolve_tenant_schema(get_access_token(), self._tenancy)
+        return self._tenant_models.get(schema, self._model_factory)
+
+    async def _audit(self, tool: str, **detail: Any) -> None:
+        """Emit a per-tenant audit event; no-op on single-tenant servers.
+
+        Only successful tool calls are audited — error paths raise before
+        reaching the audit point, so this is a data-access log, not an
+        attempt log.
+        """
+        if self._tenancy is None:
+            return
+        await emit_audit(
+            self._tenancy,
+            {"tenant_schema": self._current_tenant_schema(), "tool": tool, **detail},
+        )
+
+    async def run_async(
+        self,
+        transport=None,
+        show_banner: bool | None = None,
+        **transport_kwargs,
+    ) -> None:
+        """Run the server, refusing STDIO in tenant mode.
+
+        Args:
+            transport: Transport type — ``Transport | None`` (one of ``'stdio'``,
+                ``'http'``, ``'sse'``, ``'streamable-http'``, or ``None`` which
+                defaults to ``'stdio'``). Multi-tenant servers reject ``stdio``
+                and ``None`` because access tokens are unavailable over that
+                transport.
+            show_banner: Whether to print the startup banner. Forwarded to
+                ``FastMCP.run_async``.
+            **transport_kwargs: Additional keyword arguments forwarded to the
+                underlying transport.
+
+        Tokens only exist on HTTP transports; over STDIO get_access_token()
+        is None and every tenant check would fail at first tool call — fail
+        loudly at startup instead.
+        """
+        if self._tenancy is not None and (transport is None or transport == "stdio"):
+            raise RuntimeError(
+                "Multi-tenant mode cannot run over STDIO: access tokens are "
+                "unavailable, so tenant isolation cannot be enforced. "
+                "Run with transport='http'."
+            )
+        return await super().run_async(
+            transport=transport, show_banner=show_banner, **transport_kwargs
+        )
+
     def _register_tools(self):
         @self.tool(
             name="list_models",
@@ -229,7 +434,8 @@ class MCPSemanticModel(FastMCP):
             annotations=READONLY_ANNOTATIONS,
         )
         def list_models() -> Mapping[str, str]:
-            return {name: f"Semantic model: {name}" for name in self.models}
+            """List all available semantic models for the current request's tenant."""
+            return {name: f"Semantic model: {name}" for name in self._models_for_request()}
 
         @self.tool(
             name="get_model",
@@ -241,7 +447,8 @@ class MCPSemanticModel(FastMCP):
             model_name: str,
             ctx: Context | None = None,
         ) -> Mapping[str, Any]:
-            model = await resolve_model(self.models, model_name, ctx)
+            """Return schema metadata for one semantic model."""
+            model = await resolve_model(self._models_for_request(), model_name, ctx)
             return _build_model_info(model)
 
         @self.tool(
@@ -254,8 +461,11 @@ class MCPSemanticModel(FastMCP):
             model_name: str,
             ctx: Context | None = None,
         ) -> Mapping[str, Any]:
-            model = await resolve_model(self.models, model_name, ctx)
-            return _get_time_range_data(model, model_name)
+            """Return the time range for a model's time dimension."""
+            model = await resolve_model(self._models_for_request(), model_name, ctx)
+            result = _get_time_range_data(model, model_name)
+            await self._audit("get_time_range", model=model_name)
+            return result
 
         @self.tool(
             name="query_model",
@@ -373,7 +583,7 @@ class MCPSemanticModel(FastMCP):
             ] = None,
             ctx: Context | None = None,
         ) -> str:
-            model = await resolve_model(self.models, model_name, ctx)
+            model = await resolve_model(self._models_for_request(), model_name, ctx)
 
             if ctx:
                 await ctx.info(
@@ -409,7 +619,10 @@ class MCPSemanticModel(FastMCP):
             if ctx:
                 await ctx.report_progress(progress=90, total=100)
 
-                # Store query in session state for follow-up tools
+                # Session state is keyed by session, not token. Store the
+                # tenant schema alongside the query so summarize_results can
+                # compare and refuse a cross-tenant read if a proxy ever reuses
+                # a session across token rotations.
                 await ctx.set_state(
                     "last_query",
                     {
@@ -421,11 +634,22 @@ class MCPSemanticModel(FastMCP):
                         "limit": limit,
                         "time_grain": time_grain,
                         "time_range": time_range,
+                        "tenant_schema": self._current_tenant_schema(),
                     },
                 )
                 await ctx.set_state("last_result", result)
 
                 await ctx.report_progress(progress=100, total=100)
+
+            await self._audit(
+                "query_model",
+                model=model_name,
+                dimensions=dimensions,
+                measures=measures,
+                filters=filters,
+                limit=limit,
+                rowcount=_rowcount_from_result(result),
+            )
 
             return result
 
@@ -442,7 +666,8 @@ class MCPSemanticModel(FastMCP):
             limit: int = 20,
             ctx: Context | None = None,
         ) -> dict:
-            model = await resolve_model(self.models, model_name, ctx)
+            """Search for dimension values within a model."""
+            model = await resolve_model(self._models_for_request(), model_name, ctx)
 
             if ctx:
                 await ctx.info(
@@ -454,7 +679,7 @@ class MCPSemanticModel(FastMCP):
             if dimension_name not in dims:
                 # Try elicitation to let the user pick the correct dimension
                 resolved = False
-                if ctx:
+                if ctx and _client_supports_elicitation(ctx):
                     try:
 
                         @dataclass
@@ -474,7 +699,8 @@ class MCPSemanticModel(FastMCP):
                                 resolved = True
                                 await ctx.info(f"Resolved to dimension '{picked}'")
                     except Exception:
-                        pass  # Client doesn't support elicitation
+                        logger.debug("elicitation fallback: client elicit failed", exc_info=True)
+                        # Client doesn't support elicitation
 
                 if not resolved:
                     raise ToolError(
@@ -499,35 +725,11 @@ class MCPSemanticModel(FastMCP):
             # Total distinct count (before applying search filter)
             total_distinct = int(agg.count().execute())
 
-            def _json_safe(val):
-                """Preserve JSON-serializable types; str() everything else."""
-                if val is None or isinstance(val, (bool, int, float, str)):
-                    return val
-                return str(val)
-
-            def _fetch(base_agg, n):
-                """Fetch top n+1 rows and return (values_list, is_complete).
-
-                Executes via pyarrow, then sorts there — ibis
-                order_by().limit() can hit infinite recursion on joined models.
-                """
-                tbl_pa = base_agg.to_pyarrow()
-                sorted_pa = tbl_pa.sort_by([("frequency", "descending")])
-                top = sorted_pa.slice(0, n + 1)
-                complete = top.num_rows <= n
-                result = top.slice(0, n)
-                values = [
-                    {
-                        "value": _json_safe(result.column("_value")[i].as_py()),
-                        "count": int(result.column("frequency")[i].as_py()),
-                    }
-                    for i in range(result.num_rows)
-                ]
-                return values, complete
-
             _SEP = r"[\s\-_.,]+"
 
             # Apply case-insensitive search filter if provided
+            fallback_values = None
+            note = None
             if search_term:
                 search_normalized = re.sub(_SEP, " ", search_term.lower()).strip()
                 filtered_agg = agg.filter(
@@ -540,29 +742,37 @@ class MCPSemanticModel(FastMCP):
                         .contains(search_normalized)
                     )
                 )
-                values, is_complete = _fetch(filtered_agg, limit)
+                values, is_complete = _fetch_top_values(filtered_agg, limit)
 
                 # Fallback: if search returned nothing, show top values as reference
                 if not values:
-                    fallback_values, fallback_complete = _fetch(agg, limit)
-                    return {
-                        "total_distinct": total_distinct,
-                        "is_complete": fallback_complete,
-                        "values": [],
-                        "fallback_top_values": fallback_values,
-                        "note": (
-                            f"No matches found for '{search_term}'. "
-                            "Showing top values for reference — use one of these exact spellings."
-                        ),
-                    }
+                    fallback_values, is_complete = _fetch_top_values(agg, limit)
+                    note = (
+                        f"No matches found for '{search_term}'. "
+                        "Showing top values for reference — use one of these exact spellings."
+                    )
             else:
-                values, is_complete = _fetch(agg, limit)
+                values, is_complete = _fetch_top_values(agg, limit)
 
-            return {
+            # Audit both shapes: matched values AND the no-match fallback —
+            # the fallback still returns real dimension values.
+            await self._audit(
+                "search_dimension_values",
+                model=model_name,
+                dimension=dimension_name,
+                search_term=search_term,
+                rowcount=len(fallback_values if fallback_values is not None else values),
+            )
+
+            response = {
                 "total_distinct": total_distinct,
                 "is_complete": is_complete,
                 "values": values,
             }
+            if fallback_values is not None:
+                response["fallback_top_values"] = fallback_values
+                response["note"] = note
+            return response
 
         @self.tool(
             name="summarize_results",
@@ -594,6 +804,14 @@ class MCPSemanticModel(FastMCP):
                 raise ToolError(
                     "No previous query results found in this session. Run query_model first."
                 )
+
+            # Session state is keyed by session, not token; if a proxy reused a
+            # session across token rotations the cached result could belong to a
+            # different tenant. Compare and refuse rather than leak.
+            _verify_session_tenant(
+                (last_query or {}).get("tenant_schema"),
+                self._current_tenant_schema(),
+            )
 
             prompt_parts = [
                 "Analyze the following semantic layer query results and provide "
@@ -631,9 +849,11 @@ class MCPSemanticModel(FastMCP):
             annotations=Annotations(audience=["assistant"], priority=1.0),
         )
         def list_models_resource() -> str:
+            """List all available models as a JSON object."""
+            models = self._models_for_request()
             models_list = {}
-            for model_name in self.models:
-                model = self.models[model_name]
+            for model_name in models:
+                model = models[model_name]
                 info = {"name": model_name}
                 if model.description:
                     info["description"] = model.description
@@ -648,10 +868,12 @@ class MCPSemanticModel(FastMCP):
             annotations=Annotations(audience=["assistant"], priority=0.8),
         )
         def get_model_resource(model_name: str) -> str:
-            if model_name not in self.models:
+            """Return schema metadata for a single model as JSON."""
+            models = self._models_for_request()
+            if model_name not in models:
                 raise ToolError(f"Model {model_name} not found")
 
-            return json.dumps(_build_model_info(self.models[model_name]), indent=2)
+            return json.dumps(_build_model_info(models[model_name]), indent=2)
 
         @self.resource(
             uri="semantic://models/{model_name}/time-range",
@@ -661,10 +883,12 @@ class MCPSemanticModel(FastMCP):
             annotations=Annotations(audience=["assistant"], priority=0.5),
         )
         def get_time_range_resource(model_name: str) -> str:
-            if model_name not in self.models:
+            """Return the time range bounds for a model's time dimension as JSON."""
+            models = self._models_for_request()
+            if model_name not in models:
                 raise ToolError(f"Model {model_name} not found")
 
-            model = self.models[model_name]
+            model = models[model_name]
             all_dims = list(model.dimensions)
             time_dim_name = find_time_dimension(model, all_dims)
 
@@ -702,6 +926,10 @@ class MCPSemanticModel(FastMCP):
             parent_dirs: list[Path] = (
                 [self._parent_skills_dir] if self._parent_skills_dir is not None else []
             )
+            # Reads static self.models: safe because tenant mode zeroes all
+            # skills attrs in __init__, so this tool is never registered there.
+            # If skills ever land in tenant mode, route through
+            # _models_for_request() instead.
             return build_domain_context(parent_dirs, self._model_skills_dirs, self.models)
 
     def _register_add_skill_tool(self):

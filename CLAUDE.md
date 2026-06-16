@@ -153,6 +153,7 @@ All tool descriptions load from `docs/md/prompts/query/mcp/*.md` (23 files). The
 - **ctx.sample()**: `summarize_results` tool uses `ctx.sample()` to generate NL summaries of query results via the connected LLM
 - **Resource annotations**: All resources have `Annotations(audience=["assistant"], priority=float)` from `mcp.types`
 - **CodeMode**: Optional `code_mode=True` constructor parameter — requires `fastmcp[code-mode]>=3.1.0` (install via `boring-semantic-layer[mcp-code-mode]`). Uses `_build_code_mode_transforms()` factory with `GetTags`, `Search`, `GetSchemas` discovery tools
+- **Multi-tenancy**: Optional `tenancy=TenancyConfig(...)` constructor parameter — `models` becomes a factory `(schema: str) -> mapping`; the tenant schema resolves per request from token claims via `get_access_token()`; STDIO transport is refused (no tokens → no isolation); optional `on_query` audit callback logs (tenant, tool, query, rowcount). Requires `auth=` (token verifier). See `agents/backends/_tenancy.py` and `examples/example_mcp_multitenant.py`. Test gotcha: in-memory `Client(mcp, auth=...)` does NOT support auth — tenancy tests use an in-process ASGI harness (`tenant_client` in `test_mcp_tenancy.py`)
 
 ## Optional Dependencies
 
