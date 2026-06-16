@@ -44,6 +44,28 @@ result_df = flights.group_by("origin").aggregate("flight_count").execute()
 
 ---
 
+## 🤖 Agent Skills
+
+BSL ships **skills** that teach coding agents (Claude Code, Cursor, Codex) how to
+build, query, and deploy BSL. Install them into your project with the `bsl` CLI:
+
+```bash
+bsl skill list                      # see all available skills
+bsl skill install claude-code       # install all skills for Claude Code
+                                    # (also supported: cursor, codex)
+```
+
+For Claude Code this writes each skill to `.claude/skills/<name>/SKILL.md`, where
+it is auto-discovered and invocable as a `/<name>` slash command.
+
+| Skill | What it covers |
+|-------|----------------|
+| **`bsl-production-guide`** | End-to-end production deployment: connect a database, infer/author models, joins, query, serve over MCP, and harden with schema-per-tenant multi-tenancy + auth. Start here for production. |
+| **`bsl-model-builder`** | Building semantic models — dimensions, measures, joins, and YAML config. |
+| **`bsl-query-expert`** | Querying models at runtime — `group_by`/`aggregate`/`filter`, time grains, and charts. |
+
+---
+
 ## 📚 Documentation
 
 **[→ View the full documentation](https://boringdata.github.io/boring-semantic-layer/)**
